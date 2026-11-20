@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -287,6 +288,10 @@ func (f *forge) serveIssueRead(w http.ResponseWriter, req *http.Request) bool {
 }
 
 func main() {
+	// The HTTP client shares the two trial CPUs with the forge.
+	if _, configured := os.LookupEnv("GOMAXPROCS"); !configured {
+		runtime.GOMAXPROCS(1)
+	}
 	f := newForge()
 	ln, err := net.Listen("tcp4", "0.0.0.0:0")
 	if err != nil {
