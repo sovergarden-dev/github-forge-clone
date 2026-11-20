@@ -410,7 +410,7 @@ func typeInfo(args doc) any {
 }
 
 func (f *forge) graphUser() doc {
-	return doc{"__typename": "User", "id": f.user["node_id"], "databaseId": 1, "login": f.owner}
+	return doc{"__typename": "User", "id": f.user.NodeID, "databaseId": 1, "login": f.owner}
 }
 func (f *forge) graphComment(c doc) doc {
 	return doc{"__typename": "IssueComment", "id": c["node_id"], "databaseId": c["id"], "body": c["body"], "author": f.graphUser(), "createdAt": c["created_at"], "updatedAt": c["updated_at"]}
@@ -418,7 +418,7 @@ func (f *forge) graphComment(c doc) doc {
 
 func (f *forge) graphItem(r *repository, i *issue) doc {
 	d := i.data
-	out := doc{"__typename": "Issue", "id": d["node_id"], "databaseId": d["id"], "number": i.number, "title": d["title"], "body": d["body"], "state": strings.ToUpper(str(d["state"])), "author": f.graphUser(), "createdAt": d["created_at"], "updatedAt": d["updated_at"], "closedAt": d["closed_at"]}
+	out := doc{"__typename": "Issue", "id": d.NodeID, "databaseId": d.ID, "number": i.number, "title": d.Title, "body": d.Body, "state": strings.ToUpper(d.State), "author": f.graphUser(), "createdAt": d.CreatedAt, "updatedAt": d.UpdatedAt, "closedAt": d.ClosedAt}
 	out["comments"] = resolver(func(a doc) any {
 		rows := []any{}
 		for _, c := range i.comments {
@@ -428,7 +428,7 @@ func (f *forge) graphItem(r *repository, i *issue) doc {
 	})
 	out["labels"] = resolver(func(a doc) any {
 		rows := []any{}
-		for _, l := range d["labels"].([]doc) {
+		for _, l := range d.Labels {
 			rows = append(rows, doc{"name": l["name"], "id": l["node_id"], "color": l["color"], "description": l["description"]})
 		}
 		return connection(rows, a)
@@ -439,12 +439,12 @@ func (f *forge) graphItem(r *repository, i *issue) doc {
 	h, b := r.tips(i)
 	out["__typename"] = "PullRequest"
 	out["headRefName"], out["baseRefName"], out["headRefOid"], out["baseRefOid"] = i.head, i.base, h.String(), b.String()
-	out["merged"] = d["merged"]
-	if d["merged"] == true {
+	out["merged"] = i.merged
+	if i.merged {
 		out["state"] = "MERGED"
 	}
 	out["mergeable"] = resolver(func(a doc) any {
-		if d["merged"] == true {
+		if i.merged {
 			return "UNKNOWN"
 		}
 		if r.mergeTree(i) == nil {
@@ -524,7 +524,7 @@ func (f *forge) queryRoot() doc {
 		}),
 		"node": resolver(func(a doc) any {
 			id := str(a["id"])
-			if id == f.user["node_id"] {
+			if id == f.user.NodeID {
 				return f.graphUser()
 			}
 			n := f.byID[id]

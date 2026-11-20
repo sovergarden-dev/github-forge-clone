@@ -75,7 +75,7 @@ func ok(v any) response                    { return jsonReply(200, v) }
 type forge struct {
 	mu                      sync.RWMutex
 	auth, owner, iso, stamp string
-	user                    doc
+	user                    account
 	next                    int
 	repos                   map[string]*repository
 	byID                    map[string]nodeRef
@@ -108,7 +108,7 @@ func newForge() *forge {
 	if token := os.Getenv("MAKEFUN_SHOP_TOKEN"); token != "" {
 		f.auth = "Bearer " + token
 	}
-	f.user = doc{"id": 1, "node_id": globalID("User", 1), "login": owner, "type": "User"}
+	f.user = account{ID: 1, NodeID: globalID("User", 1), Login: owner, Type: "User"}
 	return f
 }
 

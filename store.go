@@ -10,12 +10,51 @@ import (
 	"sync"
 )
 
+type account struct {
+	ID     int    `json:"id"`
+	NodeID string `json:"node_id"`
+	Login  string `json:"login"`
+	Type   string `json:"type"`
+}
+
+type issueData struct {
+	ID        int      `json:"id"`
+	NodeID    string   `json:"node_id"`
+	Number    int      `json:"number"`
+	Title     string   `json:"title"`
+	Body      string   `json:"body"`
+	State     string   `json:"state"`
+	User      *account `json:"user"`
+	Labels    []doc    `json:"labels"`
+	Comments  int      `json:"comments"`
+	CreatedAt string   `json:"created_at"`
+	UpdatedAt string   `json:"updated_at"`
+	ClosedAt  *string  `json:"closed_at"`
+}
+
+type branchRef struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
+type pullView struct {
+	issueData
+	Head     branchRef `json:"head"`
+	Base     branchRef `json:"base"`
+	Merged   bool      `json:"merged"`
+	MergedAt *string   `json:"merged_at"`
+	MergeSHA *string   `json:"merge_commit_sha"`
+}
+
 type issue struct {
-	data           doc
+	data           issueData
 	number         int
 	comments       []doc
 	head, base     string
 	headID, baseID oid
+	merged         bool
+	mergedAt       *string
+	mergeSHA       *string
 	wire           []byte
 	wireLength     string
 }
@@ -319,7 +358,10 @@ func (f *forge) addIssue(r *repository, title, body string, labels []doc, kind s
 	gid := globalID(kind, id)
 	i := &issue{number: r.nextNumber}
 	r.nextNumber++
-	i.data = doc{"id": id, "node_id": gid, "number": i.number, "title": title, "body": body, "state": "open", "user": f.user, "labels": labels, "comments": 0, "created_at": f.iso, "updated_at": f.iso, "closed_at": nil}
+	i.data = issueData{
+		ID: id, NodeID: gid, Number: i.number, Title: title, Body: body,
+		State: "open", User: &f.user, Labels: labels, CreatedAt: f.iso, UpdatedAt: f.iso,
+	}
 	f.byID[gid] = nodeRef{r, i}
 	if kind == "Issue" {
 		r.issues[i.number] = i
@@ -340,11 +382,11 @@ func (r *repository) item(n int) *issue {
 }
 
 func (f *forge) edit(r *repository, i *issue, d doc) {
-	title := str(i.data["title"])
+	title := i.data.Title
 	if _, has := d["title"]; has {
 		title = required(d, "title")
 	}
-	labels := i.data["labels"]
+	labels := i.data.Labels
 	if v, has := d["labels"]; has {
 		labels = r.labelsFor(v)
 	}
@@ -353,16 +395,16 @@ func (f *forge) edit(r *repository, i *issue, d doc) {
 		if state != "open" && state != "closed" {
 			invalid("Invalid state")
 		}
-		i.data["state"] = state
-		i.data["closed_at"] = nil
+		i.data.State = state
+		i.data.ClosedAt = nil
 		if state == "closed" {
-			i.data["closed_at"] = f.iso
+			i.data.ClosedAt = &f.iso
 		}
 	}
 	if body, ok := d["body"].(string); ok {
-		i.data["body"] = body
+		i.data.Body = body
 	}
-	i.data["title"], i.data["labels"], i.data["updated_at"] = title, labels, f.iso
+	i.data.Title, i.data.Labels, i.data.UpdatedAt = title, labels, f.iso
 	i.encode()
 }
 
@@ -373,7 +415,7 @@ func (f *forge) comment(i *issue, body string) doc {
 	id := f.allocate()
 	c := doc{"id": id, "node_id": globalID("IssueComment", id), "body": body, "user": f.user, "created_at": f.iso, "updated_at": f.iso}
 	i.comments = append(i.comments, c)
-	i.data["comments"] = len(i.comments)
+	i.data.Comments = len(i.comments)
 	i.encode()
 	return c
 }
@@ -399,13 +441,12 @@ func (f *forge) openPull(r *repository, d doc) *issue {
 		invalid("No commits between branches")
 	}
 	for _, p := range r.pulls {
-		if p.data["state"] == "open" && p.head == head && p.base == base {
+		if p.data.State == "open" && p.head == head && p.base == base {
 			invalid("A pull request already exists")
 		}
 	}
 	p := f.newIssue(r, d, "PullRequest")
 	p.head, p.base, p.headID, p.baseID = head, base, h, b
-	p.data["merged"], p.data["merged_at"], p.data["merge_commit_sha"] = false, nil, nil
 	r.pulls[p.number] = p
 	return p
 }
@@ -420,7 +461,7 @@ func (r *repository) pull(n int) *issue {
 
 func (r *repository) tips(p *issue) (oid, oid) {
 	h, b := p.headID, p.baseID
-	if p.data["merged"] != true {
+	if !p.merged {
 		if id := r.refs[heads+p.head]; id != zero {
 			h = id
 		}
@@ -431,18 +472,12 @@ func (r *repository) tips(p *issue) (oid, oid) {
 	return h, b
 }
 
-func (r *repository) view(i *issue) doc {
+func (r *repository) view(i *issue) any {
 	if i.head == "" {
-		return i.data
+		return &i.data
 	}
 	h, b := r.tips(i)
-	d := make(doc, len(i.data)+2)
-	for key, value := range i.data {
-		d[key] = value
-	}
-	d["head"] = doc{"ref": i.head, "sha": h.String()}
-	d["base"] = doc{"ref": i.base, "sha": b.String()}
-	return d
+	return pullView{i.data, branchRef{i.head, h.String()}, branchRef{i.base, b.String()}, i.merged, i.mergedAt, i.mergeSHA}
 }
 
 type change struct {
@@ -479,7 +514,7 @@ func (r *repository) changes(p *issue) []change {
 }
 
 func (f *forge) merge(r *repository, p *issue, d doc) doc {
-	if p.data["state"] != "open" {
+	if p.data.State != "open" {
 		reject(405, "Pull request is closed")
 	}
 	h, b := r.tips(p)
@@ -494,7 +529,7 @@ func (f *forge) merge(r *repository, p *issue, d doc) doc {
 	if d["merge_method"] == "merge" {
 		parents = append(parents, h)
 	}
-	title, body := str(p.data["title"]), str(p.data["body"])
+	title, body := p.data.Title, p.data.Body
 	if t, ok := d["commit_title"].(string); ok {
 		title = t
 	}
@@ -503,7 +538,8 @@ func (f *forge) merge(r *repository, p *issue, d doc) doc {
 	}
 	sha := f.commit(r, p.base, files, title+"\n\n"+body, parents, nil)
 	p.headID, p.baseID = h, b
-	p.data["merged"], p.data["state"], p.data["merged_at"], p.data["closed_at"], p.data["merge_commit_sha"] = true, "closed", f.iso, f.iso, sha.String()
+	mergedID := sha.String()
+	p.merged, p.data.State, p.mergedAt, p.data.ClosedAt, p.mergeSHA = true, "closed", &f.iso, &f.iso, &mergedID
 	return doc{"sha": sha.String(), "merged": true, "message": "Pull Request successfully merged"}
 }
 
@@ -511,7 +547,7 @@ func (r *repository) list(pulls, withPulls bool, state string, asc bool) []*issu
 	list := make([]*issue, 0)
 	add := func(m map[int]*issue) {
 		for _, i := range m {
-			if state == "all" || i.data["state"] == state {
+			if state == "all" || i.data.State == state {
 				list = append(list, i)
 			}
 		}

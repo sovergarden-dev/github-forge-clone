@@ -249,7 +249,7 @@ func (f *forge) rest(w http.ResponseWriter, req *http.Request, raw []byte) respo
 			}
 			if method == "GET" {
 				items := r.list(pulls, true, queryDefault(q, "state", "open"), q.Get("direction") == "asc")
-				rows := []doc{}
+				rows := []any{}
 				for _, i := range page(items, req, w) {
 					rows = append(rows, r.view(i))
 				}

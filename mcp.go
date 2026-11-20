@@ -82,9 +82,9 @@ func (f *forge) callTool(t tool, d doc) (result doc) {
 			if state == "" {
 				state = "open"
 			}
-			rows := []doc{}
+			rows := []*issueData{}
 			for _, i := range r.list(false, false, state, false) {
-				rows = append(rows, i.data)
+				rows = append(rows, &i.data)
 			}
 			value = rows
 		case "create_pull_request":
