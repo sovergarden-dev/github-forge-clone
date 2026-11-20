@@ -557,7 +557,7 @@ function sendJson(res: ServerResponse, status: number, value: unknown) {
   sendJsonText(res, status, JSON.stringify(value));
 }
 
-function sendJsonText(res: ServerResponse, status: number, body: string) {
+function sendJsonText(res: ServerResponse, status: number, body: string | Buffer) {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
@@ -694,11 +694,11 @@ class Repository extends GitStore {
   issues = new Map<number, Issue>();
   comments = new Map<number, Comment[]>();
   pulls = new Map<number, Pull>();
-  issueJson = new WeakMap<Issue, string>();
+  issueJson = new WeakMap<Issue, Buffer>();
 
   json(issue: Issue) {
     let text = this.issueJson.get(issue);
-    if (text === undefined) { text = JSON.stringify(issue); this.issueJson.set(issue, text); }
+    if (text === undefined) { text = Buffer.from(JSON.stringify(issue)); this.issueJson.set(issue, text); }
     return text;
   }
   constructor(id: number, input: Input) {
@@ -1279,7 +1279,7 @@ function runTool(forge: Forge, name: string, input: Input) {
 
 async function mcp(req: IncomingMessage, res: ServerResponse, forge: Forge) {
   let message: unknown;
-  try { message = await jsonBody(req); }
+  try { message = JSON.parse((await readBody(req)).toString('utf8')); }
   catch { return sendJson(res, 400, rpcError(null, -32700, 'Parse error')); }
   if (!record(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string') return sendJson(res, 400, rpcError(null, -32600, 'Invalid Request'));
   const { method, id } = message;
@@ -1309,9 +1309,38 @@ async function mcp(req: IncomingMessage, res: ServerResponse, forge: Forge) {
   }
 }
 
+const smartRoute = /^\/([^/?]+)\/([^/?]+)\.git\/(info\/refs|git-(?:upload|receive)-pack)(?:\?([^#]*))?$/;
+const uploadService = 'git-upload-pack';
+const receiveService = 'git-receive-pack';
+
+async function smart(req: IncomingMessage, res: ServerResponse, forge: Forge, remote: RegExpExecArray) {
+  const repo = forge.repository(decodeURIComponent(remote[1]!), decodeURIComponent(remote[2]!));
+  const discovery = remote[3] === 'info/refs';
+  let service = remote[3];
+  if (discovery) {
+    const search = remote[4];
+    if (search === 'service=git-upload-pack') service = uploadService;
+    else if (search === 'service=git-receive-pack') service = receiveService;
+    else service = new URLSearchParams(search).get('service') ?? '';
+  }
+  if ((service !== uploadService && service !== receiveService) || req.method !== (discovery ? 'GET' : 'POST')) return missing();
+  const v2 = service === uploadService && req.headers['git-protocol']?.includes('version=2') === true;
+  const body = discovery ? advertise(repo, service, v2) : service === uploadService
+    ? uploadPack(repo, await readBody(req), v2) : receivePack(repo, await readBody(req));
+  res.writeHead(200, { 'content-type': 'application/x-' + service + (discovery ? '-advertisement' : '-result'), 'content-length': body.length, 'cache-control': 'no-cache' });
+  res.end(body);
+}
+
 async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
   const target = req.url ?? '/';
   const authenticated = !!token && req.headers.authorization === token;
+  if (target.includes('.git/')) {
+    const remote = smartRoute.exec(target);
+    if (remote) {
+      if (!authenticated) throw new HttpError(401, 'Bad credentials');
+      return smart(req, res, forge, remote);
+    }
+  }
   if (authenticated && (req.method === 'GET' || req.method === 'POST')) {
     const hit = /^\/api\/v3\/repos\/([\w.-]+)\/([\w.-]+)\/issues(?:\/([1-9]\d*))?$/.exec(target);
     if (hit) {
@@ -1336,19 +1365,6 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
   if (req.method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
     res.setHeader('x-oauth-scopes', 'repo, read:org');
     return sendJson(res, 200, { current_user_url: '/api/v3/user', user_repositories_url: '/api/v3/user/repos' });
-  }
-  const remote = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-(?:upload|receive)-pack)$/.exec(path);
-  if (remote) {
-    const repo = forge.repository(decodeURIComponent(remote[1]!), decodeURIComponent(remote[2]!));
-    const discovery = remote[3] === 'info/refs';
-    const service = discovery ? url.searchParams.get('service') : remote[3];
-    if (!['git-upload-pack', 'git-receive-pack'].includes(service ?? '') || req.method !== (discovery ? 'GET' : 'POST')) return missing();
-    const v2 = service === 'git-upload-pack' && req.headers['git-protocol']?.includes('version=2') === true;
-    const body = discovery ? advertise(repo, service!, v2) : service === 'git-upload-pack'
-      ? uploadPack(repo, await readBody(req), v2) : receivePack(repo, await readBody(req));
-    res.writeHead(200, { 'content-type': 'application/x-' + service + (discovery ? '-advertisement' : '-result'), 'content-length': body.length, 'cache-control': 'no-cache' });
-    res.end(body);
-    return;
   }
   if (path.startsWith('/api/v3/')) return rest(req, res, forge, url);
   if (path === '/api/graphql' && req.method === 'POST') {
