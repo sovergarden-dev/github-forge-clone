@@ -1129,6 +1129,70 @@ function graph(forge: Forge, request: unknown) {
   } catch (e) { return { errors: [{ message: e instanceof Error ? e.message : 'Invalid document' }] }; }
 }
 
+const rpcVersions = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const serverInfo = { name: 'git-forge', version: '1.0.0' };
+const capabilities = { tools: { listChanged: false } };
+const toolDefinition = (name: string, description: string, required: string[], optional: string[] = []) => ({
+  name, description, inputSchema: { type: 'object', properties: Object.fromEntries([...required, ...optional].map(key => [key, {
+    type: key === 'pull_number' ? 'integer' : key === 'private' ? 'boolean' : 'string',
+    ...(key === 'state' ? { enum: ['open', 'closed', 'all'] } : {}),
+  }])), required },
+});
+const tools = [
+  toolDefinition('create_repo', 'Create a repository for the authenticated user.', ['name'], ['description', 'private']),
+  toolDefinition('get_repo', 'Read repository metadata by owner and name.', ['owner','repo']),
+  toolDefinition('create_issue', 'Open an issue in a repository.', ['owner','repo','title'], ['body']),
+  toolDefinition('list_issues', 'List issues in a repository by state.', ['owner','repo'], ['state']),
+  toolDefinition('create_pull_request', 'Open a pull request between two branches.', ['owner','repo','title','head','base'], ['body']),
+  toolDefinition('merge_pull_request', 'Squash and merge an open pull request.', ['owner','repo','pull_number']),
+];
+const rpcError = (id: unknown, code: number, message: string) => ({ jsonrpc: '2.0', id, error: { code, message } });
+
+function runTool(forge: Forge, name: string, input: Input) {
+  if (name === 'create_repo') return forge.describe(forge.createRepo(input));
+  const repo = forge.repository(string(input.owner, 'owner'), string(input.repo, 'repo'));
+  switch (name) {
+    case 'get_repo': return forge.describe(repo);
+    case 'create_issue': return forge.newIssue(repo, input);
+    case 'list_issues': return listItems(repo.issues.values(), String(input.state ?? 'open'), false);
+    case 'create_pull_request': return forge.openPull(repo, input);
+    case 'merge_pull_request': return forge.merge(repo, Number(input.pull_number));
+    default: return invalid('Unknown tool');
+  }
+}
+
+async function mcp(req: IncomingMessage, res: ServerResponse, forge: Forge) {
+  let message: unknown;
+  try { message = await jsonBody(req); }
+  catch { return sendJson(res, 400, rpcError(null, -32700, 'Parse error')); }
+  if (!record(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string') return sendJson(res, 400, rpcError(null, -32600, 'Invalid Request'));
+  const { method, id } = message;
+  if (id === undefined) return sendJson(res, 202, undefined);
+  const args = record(message.params) ? message.params : {};
+  const ok = (result: unknown) => sendJson(res, 200, { jsonrpc: '2.0', id, result });
+  const fail = (code: number, error: string) => sendJson(res, 200, rpcError(id, code, error));
+  if (method === 'initialize') return ok({ protocolVersion: rpcVersions.includes(String(args.protocolVersion)) ? args.protocolVersion : rpcVersions[0], capabilities, serverInfo });
+  if (method === 'server/discover') return ok({ supportedVersions: rpcVersions, capabilities, serverInfo, _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo } });
+  if (method === 'ping') return ok({});
+  if (method === 'tools/list') return ok({ tools });
+  if (method !== 'tools/call') return fail(-32601, 'Method not found');
+  const def = tools.find(t => t.name === args.name);
+  if (!def) return fail(-32602, 'Unknown tool ' + String(args.name));
+  const input = args.arguments;
+  if (!record(input) || def.inputSchema.required.some(key => !Object.hasOwn(input, key))) return fail(-32602, 'Missing required arguments');
+  for (const [key, value] of Object.entries(input)) {
+    const schema = def.inputSchema.properties[key];
+    if (schema && (schema.type === 'integer' ? !Number.isInteger(value) : typeof value !== schema.type)) return fail(-32602, 'Invalid ' + key);
+  }
+  try {
+    const result = runTool(forge, def.name, input);
+    return ok({ content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: Array.isArray(result) ? { issues: result } : result, isError: false });
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error;
+    return ok({ isError: true, content: [{ type: 'text', text: error.message }] });
+  }
+}
+
 async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
   const url = new URL(req.url ?? '/', 'http://' + (req.headers.host ?? 'forge'));
   const path = url.pathname;
@@ -1160,6 +1224,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
     const body = await jsonBody(req);
     return sendJson(res, 200, Array.isArray(body) ? body.map(document => graph(forge, document)) : graph(forge, body));
   }
+  if (path === '/mcp' && req.method === 'POST') return mcp(req, res, forge);
   throw new HttpError(404, 'Not Found');
 }
 
