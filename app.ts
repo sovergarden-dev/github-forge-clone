@@ -482,6 +482,96 @@ const record = (v: unknown): v is Input => typeof v === 'object' && v !== null &
 const string = (v: unknown, field: string) => typeof v === 'string' && v.length ? v : invalid('Missing or invalid ' + field);
 const nodeId = (kind: string, id: number) => Buffer.from(kind + ':' + id).toString('base64');
 
+type Account = { id: number; node_id: string; login: string; type: string };
+type Label = { id: number; node_id: string; name: string; color: string; description: string };
+type Issue = {
+  id: number; node_id: string; number: number; title: string; body: string; state: 'open' | 'closed';
+  user: Account; labels: Label[]; comments: number; created_at: string; updated_at: string; closed_at: string | null;
+};
+type Comment = { id: number; node_id: string; body: string; user: Account; created_at: string; updated_at: string };
+type Pull = Issue & {
+  head: { ref: string; sha: string }; base: { ref: string; sha: string };
+  merged: boolean; merged_at: string | null; merge_commit_sha: string | null;
+};
+const sameEntry = (a?: Entry, b?: Entry) => a?.oid === b?.oid && a?.mode === b?.mode;
+function validPath(path: string) {
+  return path && path.split('/').every(s => s && s !== '.' && s !== '..' && s.toLowerCase() !== '.git' && !s.includes('\0'));
+}
+function checkPaths(files: Map<string, Entry>) {
+  for (const path of files.keys()) {
+    for (let i = path.indexOf('/'); i >= 0; i = path.indexOf('/', i + 1)) if (files.has(path.slice(0, i))) return false;
+  }
+  return true;
+}
+function commitData(repo: Repository, sha: string) {
+  const obj = repo.get(sha);
+  if (obj.kind !== 'commit') return missing();
+  const text = obj.bytes.toString('utf8');
+  const split = text.indexOf('\n\n');
+  const message = text.slice(split + 2).replace(/\n$/, '');
+  const [tree, ...parents] = links(obj);
+  return { sha, commit: { message, tree: { sha: tree } }, parents: parents.map(sha => ({ sha })), message, tree: { sha: tree } };
+}
+
+function fileInfo(repo: Repository, entry: Entry, path: string, withData = false) {
+  const type = entry.mode === '40000' ? 'dir' : entry.mode === '160000' ? 'submodule' : entry.mode === '120000' ? 'symlink' : 'file';
+  const bytes = type === 'dir' || type === 'submodule' ? null : repo.get(entry.oid).bytes;
+  return { type, name: entry.name, path, sha: entry.oid, size: bytes?.length ?? 0,
+    ...(withData && bytes ? { encoding: 'base64', content: bytes.toString('base64') } : {}) };
+}
+
+type Hunk = { start: number; end: number; insert: string[] };
+const linesOf = (b?: Buffer): string[] => b?.toString('utf8').match(/[^\n]*\n|[^\n]+$/g) ?? [];
+
+function lineEdits(a: string[], b: string[]): Hunk[] {
+  let lo = 0, ai = a.length, bi = b.length;
+  while (lo < ai && lo < bi && a[lo] === b[lo]) lo++;
+  while (ai > lo && bi > lo && a[ai - 1] === b[bi - 1]) { ai--; bi--; }
+  if (lo === ai && lo === bi) return [];
+  const width = bi - lo + 1, height = ai - lo + 1;
+  if (width * height > 1000000) return [{ start: lo, end: ai, insert: b.slice(lo, bi) }];
+  const lcs = new Uint32Array(width * height);
+  for (let i = ai - 1; i >= lo; i--) for (let j = bi - 1; j >= lo; j--) {
+    const k = (i - lo) * width + j - lo;
+    lcs[k] = a[i] === b[j] ? 1 + lcs[k + width + 1]! : Math.max(lcs[k + width]!, lcs[k + 1]!);
+  }
+  const hunks: Hunk[] = [];
+  let i = lo, j = lo, edit: Hunk | undefined;
+  while (i < ai || j < bi) {
+    if (i < ai && j < bi && a[i] === b[j]) { i++; j++; edit = undefined; continue; }
+    if (!edit) { edit = { start: i, end: i, insert: [] }; hunks.push(edit); }
+    const k = (i - lo) * width + j - lo;
+    if (j < bi && (i === ai || lcs[k + 1]! > lcs[k + width]!)) edit.insert.push(b[j++]!);
+    else edit.end = ++i;
+  }
+  return hunks;
+}
+
+function mergeText(repo: Repository, original?: Entry, left?: Entry, right?: Entry): Entry | undefined {
+  if (!original || !left || !right || !/^100(644|755)$/.test(original.mode) || !/^100(644|755)$/.test(left.mode) || !/^100(644|755)$/.test(right.mode)) return;
+  const buffers = [original, left, right].map(e => repo.get(e.oid).bytes);
+  if (buffers.some(buf => buf.includes(0) || !Buffer.from(buf.toString('utf8')).equals(buf))) return;
+  const [base, ours, theirs] = buffers.map(linesOf);
+  const oursEdits = lineEdits(base!, ours!);
+  const edits = [...oursEdits];
+  for (const next of lineEdits(base!, theirs!)) {
+    const overlaps = oursEdits.filter(e => e.start === next.start || e.start < next.end && next.start < e.end);
+    if (overlaps.length) {
+      if (overlaps.length === 1 && overlaps[0]!.start === next.start && overlaps[0]!.end === next.end && overlaps[0]!.insert.join('') === next.insert.join('')) continue;
+      return;
+    }
+    edits.push(next);
+  }
+  const result: string[] = [];
+  let cursor = 0;
+  for (const edit of edits.sort((a,b) => a.start - b.start)) {
+    result.push(base!.slice(cursor, edit.start).join(''), edit.insert.join(''));
+    cursor = edit.end;
+  }
+  result.push(base!.slice(cursor).join(''));
+  return { ...left, mode: left.mode === original.mode ? right.mode : left.mode, oid: repo.put('blob', Buffer.from(result.join(''))) };
+}
+
 async function jsonBody(req: IncomingMessage) {
   const body = await readBody(req);
   if (!body.length) return {};
@@ -494,12 +584,64 @@ class Repository extends GitStore {
   name: string;
   description: string;
   private: boolean;
+  nextNumber = 1;
+  labels = new Map<string, Label>();
+  issues = new Map<number, Issue>();
+  comments = new Map<number, Comment[]>();
+  pulls = new Map<number, Pull>();
   constructor(id: number, input: Input) {
     super();
     this.id = id;
     this.name = string(input.name, 'name');
     this.description = typeof input.description === 'string' ? input.description : '';
     this.private = input.private === true;
+  }
+
+  issue(number: number) { return this.issues.get(number) ?? this.pulls.get(number) ?? missing(); }
+  pull(number: number) {
+    const p = this.pulls.get(number) ?? missing();
+    if (!p.merged) {
+      p.head.sha = this.refs.get(refHead(p.head.ref)) ?? p.head.sha;
+      p.base.sha = this.refs.get(refHead(p.base.ref)) ?? p.base.sha;
+    }
+    return p;
+  }
+
+  diff(pull: Pull) {
+    const baseHistory = new Set(this.history(pull.base.sha));
+    let ancestor: string | undefined;
+    for (const oid of this.history(pull.head.sha)) if (baseHistory.has(oid)) { ancestor = oid; break; }
+    const base = this.flatten(ancestor), head = this.flatten(pull.head.sha);
+    return [...new Set([...base.keys(), ...head.keys()])].sort()
+      .filter(path => !sameEntry(base.get(path), head.get(path)))
+      .map(path => ({ path, before: base.get(path), after: head.get(path) }));
+  }
+
+  files(pull: Pull) {
+    return this.diff(pull).map(({ path, before, after }) => {
+      const bytes = (e?: Entry) => e && e.mode !== '160000' ? this.get(e.oid).bytes : undefined;
+      const a = bytes(before), b = bytes(after);
+      let additions = 0, deletions = 0;
+      if (!a?.includes(0) && !b?.includes(0)) {
+        for (const edit of lineEdits(linesOf(a), linesOf(b))) { additions += edit.insert.length; deletions += edit.end - edit.start; }
+      }
+      return { filename: path, sha: (after ?? before)!.oid, status: !before ? 'added' : !after ? 'removed' : 'modified', additions, deletions, changes: additions + deletions };
+    });
+  }
+
+  mergeTree(pull: Pull) {
+    const files = this.flatten(pull.base.sha);
+    for (const { path, before, after } of this.diff(pull)) {
+      const current = files.get(path);
+      if (sameEntry(current, after)) continue;
+      if (!sameEntry(current, before)) {
+        const merged = mergeText(this, before, current, after);
+        if (!merged) return null;
+        files.set(path, merged);
+      } else if (after) files.set(path, after);
+      else files.delete(path);
+    }
+    return checkPaths(files) ? files : null;
   }
 }
 
@@ -533,12 +675,244 @@ class Forge {
     if (this.repos.has(name.toLowerCase())) return invalid('Repository already exists');
     const repo = new Repository(this.nextId++, input);
     this.repos.set(name.toLowerCase(), repo);
+    if (input.auto_init === true) this.contentWrite(repo, 'README.md', { message: 'Initial commit', content: Buffer.from('# ' + name + '\n').toString('base64') }, false);
     return repo;
+  }
+
+  commit(repo: Repository, branch: string, files: Map<string, Entry>, message: string, parents: string[], input: Input = {}) {
+    const identity = (who: unknown) => {
+      const info = record(who) ? who : {};
+      const clean = (s: unknown, fallback: string) => typeof s === 'string' && s ? s.replace(/[\r\n<>]/g, '') : fallback;
+      return clean(info.name, this.owner) + ' <' + clean(info.email, this.owner + '@users.noreply.github.com') + '> ' + Math.floor(this.instant.getTime() / 1000) + ' +0000';
+    };
+    const raw = ['tree ' + repo.makeTree(files), ...parents.map(id => 'parent ' + id), 'author ' + identity(input.author), 'committer ' + identity(input.committer ?? input.author), '', message.replace(/\n+$/, ''), ''].join('\n');
+    const sha = repo.put('commit', Buffer.from(raw));
+    repo.refs.set(refHead(branch), sha);
+    return commitData(repo, sha);
+  }
+
+  contentWrite(repo: Repository, path: string, data: Input, remove: boolean) {
+    if (!validPath(path)) return invalid('Invalid path');
+    const branch = string(data.branch ?? repo.defaultBranch, 'branch');
+    const parent = repo.refs.get(refHead(branch));
+    if (!parent && (repo.refs.size || branch !== repo.defaultBranch)) return missing();
+    const files = repo.flatten(parent);
+    const previous = files.get(path);
+    const message = string(data.message, 'message');
+    if (remove && !previous) return missing();
+    if (previous && !data.sha) return invalid('A sha is required to replace this file');
+    if (data.sha !== undefined && data.sha !== previous?.oid) throw new HttpError(409, 'File SHA does not match');
+    let content = null;
+    if (remove) files.delete(path);
+    else {
+      if (typeof data.content !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data.content.replace(/\s/g,''))) return invalid('Invalid base64 content');
+      const entry = { name: path.split('/').at(-1)!, mode: previous?.mode ?? '100644', oid: repo.put('blob', Buffer.from(data.content, 'base64')) };
+      files.set(path, entry);
+      if (!checkPaths(files)) return invalid('File and directory names overlap');
+      content = fileInfo(repo, entry, path, true);
+    }
+    const commit = this.commit(repo, branch, files, message, parent ? [parent] : [], data);
+    return { status: previous ? 200 : 201, body: { content, commit } };
+  }
+
+  labelsFor(repo: Repository, values: unknown) {
+    if (!Array.isArray(values)) return invalid('Invalid labels');
+    return Array.from(new Set(values.map(v => string(record(v) ? v.name : v, 'label').toLowerCase())))
+      .map(name => repo.labels.get(name) ?? invalid('Unknown label'));
+  }
+
+  newIssue(repo: Repository, input: Input, kind = 'Issue'): Issue {
+    const title = string(input.title, 'title');
+    const labels = this.labelsFor(repo, input.labels ?? []);
+    const id = this.nextId++;
+    const issue: Issue = { id, node_id: nodeId(kind, id), number: repo.nextNumber++, title, body: typeof input.body === 'string' ? input.body : '', state: 'open', user: this.viewer, labels, comments: 0, created_at: this.iso, updated_at: this.iso, closed_at: null };
+    if (kind === 'Issue') repo.issues.set(issue.number, issue);
+    return issue;
+  }
+
+  editIssue(repo: Repository, issue: Issue, input: Input) {
+    const title = input.title === undefined ? issue.title : string(input.title, 'title');
+    const labels = input.labels === undefined ? issue.labels : this.labelsFor(repo, input.labels);
+    if (input.state !== undefined && input.state !== 'open' && input.state !== 'closed') return invalid('Invalid state');
+    Object.assign(issue, { title, labels, body: typeof input.body === 'string' ? input.body : issue.body, updated_at: this.iso });
+    if (input.state === 'closed' || input.state === 'open') {
+      issue.state = input.state;
+      issue.closed_at = issue.state === 'closed' ? this.iso : null;
+    }
+    return issue;
+  }
+
+  comment(repo: Repository, issue: Issue, body: unknown) {
+    const text = string(body, 'body');
+    const id = this.nextId++;
+    const comment: Comment = { id, node_id: nodeId('IssueComment', id), body: text, user: this.viewer, created_at: this.iso, updated_at: this.iso };
+    const comments = repo.comments.get(issue.number) ?? [];
+    comments.push(comment);
+    repo.comments.set(issue.number, comments);
+    issue.comments = comments.length;
+    return comment;
+  }
+
+  openPull(repo: Repository, data: Input) {
+    const branch = (value: unknown) => {
+      const name = string(value, 'branch');
+      const [owner, ref] = name.includes(':') ? name.split(':') : [this.owner, name];
+      if (owner?.toLowerCase() !== this.owner.toLowerCase()) return invalid('Unknown owner');
+      return { ref: ref!, sha: repo.refs.get(refHead(ref!)) ?? invalid('Unknown branch') };
+    };
+    const head = branch(data.head), base = branch(data.base);
+    if (head.sha === base.sha || repo.ancestor(head.sha, base.sha)) return invalid('No commits between branches');
+    if ([...repo.pulls.values()].some(p => p.state === 'open' && p.head.ref === head.ref && p.base.ref === base.ref)) return invalid('A pull request already exists');
+    const p: Pull = { ...this.newIssue(repo, data, 'PullRequest'), head, base, merged: false, merge_commit_sha: null, merged_at: null };
+    repo.pulls.set(p.number, p);
+    return p;
+  }
+
+  merge(repo: Repository, number: number, input: Input = {}) {
+    const p = repo.pull(number);
+    if (p.state !== 'open') throw new HttpError(405, 'Pull request is closed');
+    if (input.sha && input.sha !== p.head.sha) throw new HttpError(409, 'Head branch was modified');
+    const files = repo.mergeTree(p);
+    if (!files) throw new HttpError(405, 'Pull request is not mergeable');
+    const parents = input.merge_method === 'merge' ? [p.base.sha, p.head.sha] : [p.base.sha];
+    const message = String(input.commit_title ?? p.title) + '\n\n' + String(input.commit_message ?? p.body);
+    const commit = this.commit(repo, p.base.ref, files, message, parents);
+    Object.assign(p, { merged: true, state: 'closed', merged_at: this.iso, closed_at: this.iso, merge_commit_sha: commit.sha });
+    return { sha: commit.sha, merged: true, message: 'Pull Request successfully merged' };
   }
 }
 
+function page<T>(url: URL, res: ServerResponse, rows: T[]) {
+  const size = Math.min(100, Math.max(1, Number(url.searchParams.get('per_page')) || 30));
+  const number = Math.max(1, Number(url.searchParams.get('page')) || 1);
+  const last = Math.ceil(rows.length / size);
+  const links: string[] = [];
+  const link = (n: number, rel: string) => {
+    const next = new URL(url);
+    next.searchParams.set('page', String(n));
+    links.push('<' + next.href + '>; rel="' + rel + '"');
+  };
+  if (number < last) { link(number + 1, 'next'); link(last, 'last'); }
+  if (number > 1) { link(number - 1, 'prev'); link(1, 'first'); }
+  if (links.length) res.setHeader('link', links.join(', '));
+  return rows.slice((number - 1) * size, number * size);
+}
+
+function listItems<T extends Issue>(items: Iterable<T>, state: string, asc: boolean) {
+  return [...items].filter(i => state === 'all' || i.state === state).sort((a,b) => asc ? a.number - b.number : b.number - a.number);
+}
+
+function readContent(repo: Repository, path: string, ref: string) {
+  const commit = repo.resolve(ref) ?? missing();
+  let entry: Entry = { name: '', mode: '40000', oid: repo.root(commit) };
+  for (const name of path ? path.split('/') : []) {
+    if (entry.mode !== '40000') return missing();
+    entry = treeEntries(repo.get(entry.oid)).find(e => e.name === name) ?? missing();
+  }
+  if (entry.mode !== '40000') return fileInfo(repo, entry, path, true);
+  return treeEntries(repo.get(entry.oid)).map(e => fileInfo(repo, e, (path ? path + '/' : '') + e.name));
+}
+
+async function rest(req: IncomingMessage, res: ServerResponse, forge: Forge, url: URL) {
+  const method = req.method;
+  const parts = url.pathname.slice('/api/v3/'.length).replace(/\/$/, '').split('/').map(decodeURIComponent);
+  const json = ['POST','PUT','PATCH','DELETE'].includes(method ?? '') ? await jsonBody(req) : {};
+  if (!record(json)) return invalid();
+  const ok = (body: unknown, status = 200) => sendJson(res, status, body);
+  const query = url.searchParams;
+  if (parts.length === 1 && method === 'GET') {
+    if (parts[0] === 'user') return ok(forge.viewer);
+    if (parts[0] === 'meta') return ok({ installed_version: '3.17.0' });
+  }
+  if (parts.length === 2 && parts[0] === 'user' && parts[1] === 'repos') {
+    if (method === 'POST') return ok(forge.describe(forge.createRepo(json)), 201);
+    if (method === 'GET') return ok(page(url, res, [...forge.repos.values()]).map(r => forge.describe(r)));
+  }
+  if (parts[0] !== 'repos' || !parts[1] || !parts[2]) return missing();
+  const repo = forge.repository(parts[1], parts[2]);
+  const [resource, identifier, action] = parts.slice(3);
+  const path = parts.slice(4).join('/');
+  if (parts.length === 3) {
+    if (method === 'DELETE') { forge.repos.delete(repo.name.toLowerCase()); return ok(undefined, 204); }
+    if (method === 'PATCH') {
+      if (json.default_branch !== undefined) {
+        const branch = string(json.default_branch, 'default_branch');
+        if (!repo.refs.has(refHead(branch))) return invalid('Unknown default branch');
+        repo.defaultBranch = branch;
+      }
+      if (typeof json.description === 'string') repo.description = json.description;
+      if (typeof json.private === 'boolean') repo.private = json.private;
+    }
+    if (method === 'PATCH' || method === 'GET') return ok(forge.describe(repo));
+  }
+  if (resource === 'git' && (identifier === 'refs' || identifier === 'ref')) {
+    const ref = method === 'POST' ? string(json.ref, 'ref') : 'refs/' + parts.slice(5).join('/');
+    const format = (sha: string) => ({ ref, object: { type: repo.get(sha).kind, sha } });
+    if (method === 'POST' && !action) {
+      const sha = string(json.sha, 'sha');
+      if (!gitNameOk(ref) || repo.refs.has(ref) || !repo.objects.has(sha) || ref.startsWith('refs/heads/') && repo.get(sha).kind !== 'commit') return invalid('Invalid reference');
+      repo.refs.set(ref, sha);
+      return ok(format(sha), 201);
+    }
+    if (method === 'GET' && action) return ok(format(repo.refs.get(ref) ?? missing()));
+  }
+  if (resource === 'branches' && method === 'GET') {
+    const describe = (ref: string) => ({ name: ref.slice(11), commit: { sha: repo.refs.get(ref) ?? missing() }, protected: false });
+    return ok(path ? describe(refHead(path)) : page(url, res, [...repo.refs.keys()].filter(r => r.startsWith('refs/heads/')).sort()).map(describe));
+  }
+  if (resource === 'commits' && method === 'GET') {
+    const ref = path || query.get('sha') || repo.defaultBranch;
+    const sha = repo.resolve(ref) ?? missing();
+    return ok(path ? commitData(repo, repo.peel(sha)) : page(url, res, [...repo.history(repo.peel(sha))]).map(id => commitData(repo, id)));
+  }
+  if (resource === 'contents') {
+    if (method === 'GET') return ok(readContent(repo, path, query.get('ref') ?? repo.defaultBranch));
+    if (method === 'PUT' || method === 'DELETE') {
+      const result = forge.contentWrite(repo, path, json, method === 'DELETE');
+      return ok(result.body, result.status);
+    }
+  }
+  if (resource === 'labels' && parts.length <= 5) {
+    if (method === 'GET') return ok(identifier ? repo.labels.get(identifier.toLowerCase()) ?? missing() : page(url, res, [...repo.labels.values()]));
+    if (method === 'POST' && !identifier) {
+      const name = string(json.name, 'name');
+      const color = string(json.color ?? 'ededed', 'color');
+      if (!/^[0-9a-f]{6}$/i.test(color) || repo.labels.has(name.toLowerCase())) return invalid('Invalid or duplicate label');
+      const id = forge.nextId++;
+      const label = { id, node_id: nodeId('Label', id), name, color, description: String(json.description ?? '') };
+      repo.labels.set(name.toLowerCase(), label);
+      return ok(label, 201);
+    }
+  }
+  const asc = query.get('direction') === 'asc', state = query.get('state') ?? 'open';
+  if (resource === 'issues') {
+    if (!identifier) {
+      if (method === 'POST') return ok(forge.newIssue(repo, json), 201);
+      if (method === 'GET') return ok(page(url, res, listItems([...repo.issues.values(), ...repo.pulls.values()], state, asc)));
+    }
+    const issue = repo.issue(Number(identifier));
+    if (!action && method === 'GET') return ok(issue);
+    if (!action && method === 'PATCH') return ok(forge.editIssue(repo, issue, json));
+    if (action === 'comments' && parts.length === 6) {
+      if (method === 'GET') return ok(page(url, res, repo.comments.get(issue.number) ?? []));
+      if (method === 'POST') return ok(forge.comment(repo, issue, json.body), 201);
+    }
+  }
+  if (resource === 'pulls') {
+    if (!identifier) {
+      if (method === 'POST') return ok(forge.openPull(repo, json), 201);
+      if (method === 'GET') return ok(page(url, res, listItems(repo.pulls.values(), state, asc)).map(p => repo.pull(p.number)));
+    }
+    const p = repo.pull(Number(identifier));
+    if (!action && method === 'GET') return ok(p);
+    if (action === 'files' && parts.length === 6 && method === 'GET') return ok(page(url, res, repo.files(p)));
+    if (action === 'merge' && parts.length === 6 && method === 'PUT') return ok(forge.merge(repo, p.number, json));
+  }
+  return missing();
+}
+
 async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
-  const url = new URL(req.url ?? '/', 'http://forge');
+  const url = new URL(req.url ?? '/', 'http://' + (req.headers.host ?? 'forge'));
   const path = url.pathname;
   if (req.method === 'GET' && path === '/healthz') return sendJson(res, 200, { ok: true });
   if (/^\/(?:api(?:\/|$)|mcp(?:\/|$))/.test(path) || path.includes('.git/')) {
@@ -563,11 +937,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
     res.end(body);
     return;
   }
-  if (path === '/api/v3/user/repos' && req.method === 'POST') {
-    const body = await jsonBody(req);
-    if (!record(body)) return invalid();
-    return sendJson(res, 201, forge.describe(forge.createRepo(body)));
-  }
+  if (path.startsWith('/api/v3/')) return rest(req, res, forge, url);
   throw new HttpError(404, 'Not Found');
 }
 
