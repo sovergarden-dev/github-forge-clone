@@ -177,7 +177,7 @@ func (f *forge) route(w http.ResponseWriter, req *http.Request) response {
 	}
 	body := bodyOf(req)
 	write := req.Method != "GET" && req.Method != "HEAD"
-	if isGit {
+	if isGit && !isAPI {
 		write = req.Method == "POST" && strings.HasSuffix(path, "/git-receive-pack")
 	}
 	if write {
@@ -195,6 +195,7 @@ func (f *forge) route(w http.ResponseWriter, req *http.Request) response {
 	case path == "/mcp" && req.Method == "POST":
 		return f.mcp(body)
 	case isGit:
+		w.Header().Set("Cache-Control", "no-cache")
 		return f.smart(req, body)
 	default:
 		missing()
@@ -217,6 +218,9 @@ func (f *forge) safely(w http.ResponseWriter, req *http.Request) (r response) {
 }
 
 func (f *forge) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if f.serveIssueRead(w, req) {
+		return
+	}
 	r := f.safely(w, req)
 	h := w.Header()
 	h["Date"] = nil
@@ -231,6 +235,51 @@ func (f *forge) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if len(r.body) > 0 {
 		_, _ = w.Write(r.body)
 	}
+}
+
+var jsonHeader = []string{jsonType}
+
+// Cached issue bytes and their length are replaced together on each write.
+func (f *forge) serveIssueRead(w http.ResponseWriter, req *http.Request) bool {
+	if req.Method != http.MethodGet || req.URL.RawQuery != "" {
+		return false
+	}
+	path, ok := strings.CutPrefix(req.URL.Path, "/api/v3/repos/")
+	if !ok || f.auth == "" || req.Header.Get("Authorization") != f.auth {
+		return false
+	}
+	owner, path, ok := strings.Cut(path, "/")
+	if !ok || !strings.EqualFold(owner, f.owner) {
+		return false
+	}
+	name, tail, ok := strings.Cut(path, "/issues/")
+	if !ok {
+		return false
+	}
+	number, err := strconv.Atoi(tail)
+	if err != nil {
+		return false
+	}
+	f.mu.RLock()
+	var data []byte
+	var length string
+	if repo := f.repos[strings.ToLower(name)]; repo != nil {
+		if issue := repo.issues[number]; issue != nil {
+			data, length = issue.wire, issue.wireLength
+		}
+	}
+	f.mu.RUnlock()
+	if data == nil {
+		return false
+	}
+	header := w.Header()
+	header["Date"] = nil
+	header["Content-Type"] = jsonHeader
+	header["Content-Length"] = []string{length}
+	header["X-Github-Request-Id"] = []string{strconv.FormatUint(f.requestCount.Add(1), 16)}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+	return true
 }
 
 func main() {

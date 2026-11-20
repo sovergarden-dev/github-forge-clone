@@ -17,6 +17,7 @@ type issue struct {
 	head, base     string
 	headID, baseID oid
 	wire           []byte
+	wireLength     string
 }
 
 type repository struct {
@@ -28,7 +29,7 @@ type repository struct {
 	refs                           map[string]oid
 	labels                         map[string]doc
 	issues, pulls                  map[int]*issue
-	wireMu                         sync.Mutex
+	wireMu                         sync.RWMutex
 	lastRefs, lastFetch            wireCache
 	ads                            [2][]byte
 }
@@ -305,17 +306,25 @@ func (r *repository) labelsFor(input any) []doc {
 
 func (f *forge) newIssue(r *repository, d doc, kind string) *issue {
 	title := required(d, "title")
-	labels := r.labelsFor(d["labels"])
+	return f.addIssue(r, title, str(d["body"]), r.labelsFor(d["labels"]), kind)
+}
+
+func (i *issue) encode() {
+	i.wire = marshal(i.data)
+	i.wireLength = strconv.Itoa(len(i.wire))
+}
+
+func (f *forge) addIssue(r *repository, title, body string, labels []doc, kind string) *issue {
 	id := f.allocate()
 	gid := globalID(kind, id)
 	i := &issue{number: r.nextNumber}
 	r.nextNumber++
-	i.data = doc{"id": id, "node_id": gid, "number": i.number, "title": title, "body": str(d["body"]), "state": "open", "user": f.user, "labels": labels, "comments": 0, "created_at": f.iso, "updated_at": f.iso, "closed_at": nil}
+	i.data = doc{"id": id, "node_id": gid, "number": i.number, "title": title, "body": body, "state": "open", "user": f.user, "labels": labels, "comments": 0, "created_at": f.iso, "updated_at": f.iso, "closed_at": nil}
 	f.byID[gid] = nodeRef{r, i}
 	if kind == "Issue" {
 		r.issues[i.number] = i
 	}
-	i.wire = marshal(i.data)
+	i.encode()
 	return i
 }
 
@@ -354,7 +363,7 @@ func (f *forge) edit(r *repository, i *issue, d doc) {
 		i.data["body"] = body
 	}
 	i.data["title"], i.data["labels"], i.data["updated_at"] = title, labels, f.iso
-	i.wire = marshal(i.data)
+	i.encode()
 }
 
 func (f *forge) comment(i *issue, body string) doc {
@@ -365,7 +374,7 @@ func (f *forge) comment(i *issue, body string) doc {
 	c := doc{"id": id, "node_id": globalID("IssueComment", id), "body": body, "user": f.user, "created_at": f.iso, "updated_at": f.iso}
 	i.comments = append(i.comments, c)
 	i.data["comments"] = len(i.comments)
-	i.wire = marshal(i.data)
+	i.encode()
 	return c
 }
 

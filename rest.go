@@ -56,7 +56,10 @@ func queryDefault(q url.Values, key, fallback string) string {
 func (f *forge) rest(w http.ResponseWriter, req *http.Request, raw []byte) response {
 	method := req.Method
 	path := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v3"), "/")
-	d := jsonObject(raw)
+	var d doc
+	if len(raw) > 0 {
+		d = jsonObject(raw)
+	}
 	switch path {
 	case "":
 		if method == "GET" {

@@ -281,15 +281,28 @@ func (r *repository) closure(tips []oid, depth int, stop map[oid]bool) reach {
 type wireCache struct{ key, value []byte }
 
 func (r *repository) uploadPack(data []byte, v2 bool) []byte {
-	r.wireMu.Lock()
-	defer r.wireMu.Unlock()
-	if v2 {
-		if r.lastRefs.value != nil && bytes.Equal(data, r.lastRefs.key) {
+	cached := func() []byte {
+		if !v2 {
+			return nil
+		}
+		if bytes.Equal(data, r.lastRefs.key) && r.lastRefs.value != nil {
 			return r.lastRefs.value
 		}
-		if r.lastFetch.value != nil && bytes.Equal(data, r.lastFetch.key) {
+		if bytes.Equal(data, r.lastFetch.key) {
 			return r.lastFetch.value
 		}
+		return nil
+	}
+	r.wireMu.RLock()
+	response := cached()
+	r.wireMu.RUnlock()
+	if response != nil {
+		return response
+	}
+	r.wireMu.Lock()
+	defer r.wireMu.Unlock()
+	if response = cached(); response != nil {
+		return response
 	}
 	args, _ := readPackets(data, false)
 	var wants, haves, shallows []oid
