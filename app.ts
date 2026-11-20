@@ -1,4 +1,452 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createHash } from 'node:crypto';
+import { deflateSync, inflateSync } from 'node:zlib';
+
+type Kind = 'commit' | 'tree' | 'blob' | 'tag';
+type Entry = { mode: string; name: string; oid: string };
+type ObjectData = {
+  kind: Kind;
+  bytes: Buffer;
+  entries?: Entry[];
+  links?: string[];
+};
+const kinds = [undefined, 'commit', 'tree', 'blob', 'tag'] as const;
+const zero = '0'.repeat(40);
+const refHead = (branch: string) => 'refs/heads/' + branch;
+const invalid = (message = 'Validation Failed'): never => { throw new HttpError(422, message); };
+const missing = (): never => { throw new HttpError(404, 'Not Found'); };
+const badGit = (): never => { throw new HttpError(400, 'Invalid git data'); };
+
+function hash(type: Kind, bytes: Buffer) {
+  return createHash('sha1').update(type + ' ' + bytes.length + '\0').update(bytes).digest('hex');
+}
+
+function treeEntries(obj: ObjectData): Entry[] {
+  if (obj.kind !== 'tree') return badGit();
+  if (obj.entries) return obj.entries;
+  const entries: Entry[] = [];
+  const data = obj.bytes;
+  let pos = 0;
+  while (pos < data.length) {
+    const space = data.indexOf(32, pos);
+    const nul = data.indexOf(0, space + 1);
+    if (space < pos || nul <= space || nul + 21 > data.length) return badGit();
+    entries.push({ mode: data.toString('ascii', pos, space), name: data.toString('utf8', space + 1, nul), oid: data.toString('hex', nul + 1, nul + 21) });
+    pos = nul + 21;
+  }
+  return obj.entries = entries;
+}
+
+function links(obj: ObjectData): string[] {
+  if (obj.links) return obj.links;
+  if (obj.kind === 'blob') return obj.links = [];
+  if (obj.kind === 'tree') return obj.links = treeEntries(obj).filter(e => e.mode !== '160000').map(e => e.oid);
+  const end = obj.bytes.indexOf('\n\n');
+  if (end < 0) return badGit();
+  const header = obj.bytes.toString('utf8', 0, end);
+  return obj.links = Array.from(header.matchAll(/^(?:tree|parent|object) ([a-f0-9]{40})$/gm), m => m[1]!);
+}
+
+function gitNameOk(ref: string) {
+  return /^refs\/[^/]+\/.+/.test(ref) && !/[\x00-\x20\x7f~^:?*\[\\]|\.{2}|@\{|\/\/|\/\.|\.lock(?:\/|$)|[./]$/.test(ref);
+}
+
+class GitStore {
+  objects = new Map<string, ObjectData>();
+  refs = new Map<string, string>();
+  defaultBranch = 'main';
+
+  put(kind: Kind, bytes: Buffer): string {
+    const oid = hash(kind, bytes);
+    if (!this.objects.has(oid)) this.objects.set(oid, { kind, bytes });
+    return oid;
+  }
+
+  get(oid: string) {
+    return this.objects.get(oid) ?? badGit();
+  }
+
+  resolve(ref: string): string | undefined {
+    if (ref === 'HEAD') return this.refs.get(refHead(this.defaultBranch));
+    return this.refs.get(ref) ?? this.refs.get(refHead(ref)) ?? this.refs.get('refs/tags/' + ref) ?? (this.objects.has(ref) ? ref : undefined);
+  }
+
+  peel(oid: string) {
+    let obj = this.get(oid);
+    while (obj.kind === 'tag') {
+      oid = links(obj)[0]!;
+      obj = this.get(oid);
+    }
+    return oid;
+  }
+
+  *history(oid: string): Generator<string> {
+    const visited = new Set<string>();
+    const queue = [oid];
+    for (let i = 0; i < queue.length; ++i) {
+      const current = queue[i]!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      const obj = this.get(current);
+      if (obj.kind !== 'commit') continue;
+      yield current;
+      queue.push(...links(obj).slice(1));
+    }
+  }
+
+  ancestor(old: string, next: string) {
+    for (const ancestor of this.history(next)) if (ancestor === old) return true;
+    return false;
+  }
+
+  root(oid: string) {
+    const obj = this.get(this.peel(oid));
+    return obj.kind === 'tree' ? this.peel(oid) : links(obj)[0] ?? badGit();
+  }
+
+  flatten(oid?: string) {
+    const files = new Map<string, Entry>();
+    if (!oid) return files;
+    const walk = (tree: string, prefix: string) => {
+      for (const entry of treeEntries(this.get(tree))) {
+        const path = prefix + entry.name;
+        if (entry.mode === '40000') walk(entry.oid, path + '/');
+        else files.set(path, entry);
+      }
+    };
+    walk(this.root(oid), '');
+    return files;
+  }
+
+  makeTree(files: Map<string, Entry>) {
+    interface Directory { files: Entry[]; dirs: Map<string, Directory> }
+    const directory = (): Directory => ({ files: [], dirs: new Map() });
+    const root = directory();
+    for (const [path, entry] of files) {
+      const parts = path.split('/');
+      let dir = root;
+      for (const name of parts.slice(0, -1)) {
+        if (!dir.dirs.has(name)) dir.dirs.set(name, directory());
+        dir = dir.dirs.get(name)!;
+      }
+      dir.files.push({ ...entry, name: parts.at(-1)! });
+    }
+    const encode = (dir: Directory): string => {
+      for (const [name, child] of dir.dirs) dir.files.push({ name, mode: '40000', oid: encode(child) });
+      const order = (e: Entry) => Buffer.from(e.name + (e.mode === '40000' ? '/' : ''));
+      dir.files.sort((a, b) => Buffer.compare(order(a), order(b)));
+      return this.put('tree', Buffer.concat(dir.files.flatMap(e => [Buffer.from(e.mode + ' ' + e.name + '\0'), Buffer.from(e.oid, 'hex')])));
+    };
+    return encode(root);
+  }
+}
+
+function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let offset = 0;
+  function octet() {
+    if (offset >= delta.length) return badGit();
+    return delta[offset++]!;
+  }
+  function integer() {
+    let value = 0;
+    for (let shift = 0; shift <= 28; shift += 7) {
+      const byte = octet();
+      value += (byte & 127) * 2 ** shift;
+      if (byte < 128) return value;
+    }
+    return badGit();
+  }
+  if (integer() !== base.length) return badGit();
+  const size = integer();
+  if (size > 64 * 1024 * 1024) return badGit();
+  const result = Buffer.allocUnsafe(size);
+  let written = 0;
+  while (offset < delta.length) {
+    const op = octet();
+    if (op === 0) return badGit();
+    if (op < 128) {
+      if (offset + op > delta.length || written + op > size) return badGit();
+      delta.copy(result, written, offset, offset + op);
+      offset += op;
+      written += op;
+    } else {
+      let start = 0, length = 0;
+      for (let i = 0; i < 4; i++) if (op & (1 << i)) start += octet() * 256 ** i;
+      for (let i = 0; i < 3; i++) if (op & (16 << i)) length += octet() * 256 ** i;
+      if (!length) length = 65536;
+      if (start + length > base.length || written + length > size) return badGit();
+      base.copy(result, written, start, start + length);
+      written += length;
+    }
+  }
+  return written === size ? result : badGit();
+}
+
+function unpack(git: GitStore, data: Buffer) {
+  const end = data.length - 20;
+  if (end < 12 || data.toString('ascii', 0, 4) !== 'PACK' || ![2, 3].includes(data.readUInt32BE(4))) return badGit();
+  if (!createHash('sha1').update(data.subarray(0, end)).digest().equals(data.subarray(end))) return badGit();
+  const byOffset = new Map<number, ObjectData>();
+  const staged = new Map<string, ObjectData>();
+  type Delta = { offset: number; base: number | string; bytes: Buffer };
+  let pending: Delta[] = [];
+  let pos = 12;
+  const octet = () => pos < end ? data[pos++]! : badGit();
+  function accept(offset: number, kind: Kind, bytes: Buffer) {
+    const oid = hash(kind, bytes);
+    const obj = git.objects.get(oid) ?? { kind, bytes };
+    byOffset.set(offset, obj);
+    staged.set(oid, obj);
+  }
+  function resolve(delta: Delta) {
+    const key = delta.base;
+    const base = typeof key === 'number' ? byOffset.get(key) : staged.get(key) ?? git.objects.get(key);
+    if (!base) return false;
+    accept(delta.offset, base.kind, applyDelta(base.bytes, delta.bytes));
+    return true;
+  }
+  const count = data.readUInt32BE(8);
+  for (let i = 0; i < count; i++) {
+    const offset = pos;
+    let byte = octet();
+    const type = byte >> 4 & 7;
+    let size = byte & 15;
+    for (let shift = 4; byte & 128; shift += 7) {
+      if (shift > 32) return badGit();
+      byte = octet();
+      size += (byte & 127) * 2 ** shift;
+    }
+    if (size > 64 * 1024 * 1024) return badGit();
+    let base: string | number | undefined;
+    if (type === 6) {
+      byte = octet();
+      let distance = byte & 127;
+      while (byte & 128) {
+        byte = octet();
+        distance = (distance + 1) * 128 + (byte & 127);
+        if (distance > offset) return badGit();
+      }
+      base = offset - distance;
+    } else if (type === 7) {
+      base = data.toString('hex', pos, pos + 20);
+      pos += 20;
+    } else if (type < 1 || type > 4) return badGit();
+    const inflated = inflateSync(data.subarray(pos, end), { info: true, maxOutputLength: Math.max(size, 1) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    pos += inflated.engine.bytesWritten;
+    if (inflated.buffer.length !== size) return badGit();
+    if (base === undefined) accept(offset, kinds[type as 1 | 2 | 3 | 4], inflated.buffer);
+    else {
+      const delta = { offset, base, bytes: inflated.buffer };
+      if (!resolve(delta)) pending.push(delta);
+    }
+  }
+  if (pos !== end) return badGit();
+  while (pending.length) {
+    const rest = pending.filter(d => !resolve(d));
+    if (rest.length === pending.length) return badGit();
+    pending = rest;
+  }
+  for (const [, obj] of staged) {
+    for (const oid of links(obj)) if (!staged.has(oid) && !git.objects.has(oid)) return badGit();
+  }
+  for (const [oid, obj] of staged) git.objects.set(oid, obj);
+}
+
+function pack(git: GitStore, objects: Set<string>) {
+  const header = Buffer.alloc(12);
+  header.write('PACK');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(objects.size, 8);
+  const parts = [header];
+  for (const oid of objects) {
+    const obj = git.get(oid);
+    let size = obj.bytes.length;
+    let byte = kinds.indexOf(obj.kind) * 16 + (size & 15);
+    size = Math.floor(size / 16);
+    const encoding: number[] = [];
+    while (size) {
+      encoding.push(byte | 128);
+      byte = size & 127;
+      size = Math.floor(size / 128);
+    }
+    encoding.push(byte);
+    parts.push(Buffer.from(encoding), deflateSync(obj.bytes));
+  }
+  const body = Buffer.concat(parts);
+  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+}
+
+const flush = Buffer.from('0000');
+const delim = Buffer.from('0001');
+const packet = (s: Buffer | string) => {
+  const data = typeof s === 'string' ? Buffer.from(s) : s;
+  return Buffer.concat([Buffer.from((data.length + 4).toString(16).padStart(4, '0')), data]);
+};
+const packets = (lines: string[]) => Buffer.concat([...lines.map(s => packet(s + '\n')), flush]);
+
+function readPackets(data: Buffer, receive = false) {
+  const lines: string[] = [];
+  let pos = 0;
+  while (pos < data.length) {
+    const hex = data.toString('ascii', pos, pos + 4);
+    if (!/^[a-f0-9]{4}$/i.test(hex)) return badGit();
+    const len = parseInt(hex, 16);
+    pos += 4;
+    if (len === 0 && receive) break;
+    if (len < 3) continue;
+    if (len < 4 || pos + len - 4 > data.length) return badGit();
+    lines.push(data.toString('utf8', pos, pos + len - 4).replace(/\n$/, ''));
+    pos += len - 4;
+  }
+  return { lines, tail: data.subarray(pos) };
+}
+
+function band(data: Buffer) {
+  const chunks: Buffer[] = [];
+  for (let start = 0; start < data.length; start += 65515) {
+    chunks.push(packet(Buffer.concat([Buffer.from([1]), data.subarray(start, start + 65515)])));
+  }
+  chunks.push(flush);
+  return Buffer.concat(chunks);
+}
+
+function lsRefs(git: GitStore, args: string[]) {
+  const refs: string[] = [];
+  const prefixes = args.filter(s => s.startsWith('ref-prefix ')).map(s => s.slice(11));
+  const include = (ref: string) => prefixes.length === 0 || prefixes.some(p => ref.startsWith(p));
+  const head = refHead(git.defaultBranch);
+  if (include('HEAD') && (git.refs.has(head) || args.includes('unborn'))) {
+    refs.push((git.refs.get(head) ?? 'unborn') + ' HEAD' + (args.includes('symrefs') ? ' symref-target:' + head : ''));
+  }
+  for (const ref of [...git.refs.keys()].sort()) {
+    if (!include(ref)) continue;
+    const oid = git.refs.get(ref)!;
+    const peeled = args.includes('peel') ? git.peel(oid) : oid;
+    refs.push(oid + ' ' + ref + (peeled === oid ? '' : ' peeled:' + peeled));
+  }
+  return packets(refs);
+}
+
+const v2Advertisement = packets(['version 2', 'agent=forge/1', 'ls-refs=unborn', 'fetch=shallow', 'object-format=sha1']);
+
+function advertise(git: GitStore, service: string, v2: boolean) {
+  if (v2) return v2Advertisement;
+  const head = refHead(git.defaultBranch);
+  const upload = service === 'git-upload-pack';
+  const capabilities = upload
+    ? 'side-band-64k ofs-delta shallow symref=HEAD:' + head + ' agent=forge/1'
+    : 'report-status side-band-64k delete-refs ofs-delta object-format=sha1 agent=forge/1';
+  const refs: string[] = [];
+  if (upload && git.refs.has(head)) refs.push(git.refs.get(head) + ' HEAD');
+  for (const ref of [...git.refs.keys()].sort()) {
+    const oid = git.refs.get(ref)!;
+    refs.push(oid + ' ' + ref);
+    if (upload && git.get(oid).kind === 'tag') refs.push(git.peel(oid) + ' ' + ref + '^{}');
+  }
+  if (!refs.length) refs.push(zero + ' capabilities^{}');
+  refs[0] += '\0' + capabilities;
+  return Buffer.concat([packets(['# service=' + service]), packets(refs)]);
+}
+
+function closure(git: GitStore, tips: string[], depth: number, stops: Set<string>) {
+  const objects = new Set<string>();
+  const boundary = new Set<string>();
+  const commits: [string, number][] = [];
+  function visit(oid: string, level: number) {
+    if (objects.has(oid)) return;
+    const obj = git.get(oid);
+    if (obj.kind === 'commit') {
+      commits.push([oid, level]);
+      return;
+    }
+    objects.add(oid);
+    for (const child of links(obj)) visit(child, level);
+  }
+  for (const oid of tips) visit(oid, 1);
+  for (let i = 0; i < commits.length; i++) {
+    const [oid, level] = commits[i]!;
+    if (objects.has(oid)) continue;
+    objects.add(oid);
+    const [tree, ...parents] = links(git.get(oid));
+    visit(tree!, level);
+    if (level >= depth || stops.has(oid)) {
+      if (parents.length) boundary.add(oid);
+    } else {
+      for (const parent of parents) commits.push([parent, level + 1]);
+    }
+  }
+  return { objects, boundary };
+}
+
+function uploadPack(git: GitStore, data: Buffer, v2: boolean) {
+  const { lines } = readPackets(data);
+  if (v2 && lines.includes('command=ls-refs')) return lsRefs(git, lines);
+  if (v2 && !lines.includes('command=fetch')) return badGit();
+  const args = (key: string) => lines.filter(s => s.startsWith(key + ' ')).map(s => s.split(' ')[1]!);
+  const wants = args('want');
+  if (!wants.length) return flush;
+  const haves = args('have').filter(oid => git.objects.has(oid));
+  const shallow = new Set(args('shallow'));
+  const depth = Number(args('deepen')[0] ?? Infinity);
+  if (!(depth > 0)) return badGit();
+  const response: Buffer[] = [];
+  if (v2 && !lines.includes('done')) {
+    response.push(packet('acknowledgments\n'), packets(haves.length ? haves.map(oid => 'ACK ' + oid) : ['NAK']));
+    return Buffer.concat(response);
+  }
+  const want = closure(git, wants, depth, new Set());
+  const have = closure(git, haves, Infinity, shallow);
+  for (const oid of have.objects) want.objects.delete(oid);
+  const changes = [...want.boundary].filter(oid => !shallow.has(oid)).map(oid => 'shallow ' + oid);
+  for (const oid of shallow) {
+    if (have.objects.has(oid) && !want.boundary.has(oid) && (depth > 1 || !Number.isFinite(depth))) changes.push('unshallow ' + oid);
+  }
+  if (changes.length || !v2 && Number.isFinite(depth)) {
+    if (v2) response.push(packet('shallow-info\n'));
+    response.push(...changes.map(line => packet(line + '\n')), v2 ? delim : flush);
+  }
+  if (!v2 && !lines.includes('done') && !haves.length && Number.isFinite(depth)) return Buffer.concat(response);
+  response.push(packet(v2 ? 'packfile\n' : haves.length ? 'ACK ' + haves[0] + '\n' : 'NAK\n'));
+  const body = pack(git, want.objects);
+  response.push(v2 || lines.some(l => l.includes('side-band-64k')) ? band(body) : body);
+  return Buffer.concat(response);
+}
+
+function receivePack(git: GitStore, data: Buffer) {
+  const { lines, tail } = readPackets(data, true);
+  if (!lines.length) return flush;
+  const [first, capabilities = ''] = lines[0]!.split('\0');
+  lines[0] = first!;
+  const commands = lines.map(line => {
+    const [old, next, ref] = line.split(' ');
+    if (!ref || !gitNameOk(ref) || ![old, next].every(id => /^[a-f0-9]{40}$/.test(id ?? ''))) return badGit();
+    return { old: old!, next: next!, ref };
+  });
+  let unpacked = true;
+  try {
+    if (tail.length) unpack(git, tail);
+  } catch {
+    unpacked = false;
+  }
+  const report = [unpacked ? 'unpack ok' : 'unpack invalid pack'];
+  for (const { old, next, ref } of commands) {
+    let reason = '';
+    if (!unpacked) reason = 'unpacker error';
+    else if ((git.refs.get(ref) ?? zero) !== old) reason = 'stale info';
+    else if (next !== zero && !git.objects.has(next)) reason = 'missing object';
+    else if (next !== zero && ref.startsWith('refs/heads/') && git.get(next).kind !== 'commit') reason = 'not a commit';
+    else if (old !== zero && next !== zero && old !== next && (!ref.startsWith('refs/heads/') || !git.ancestor(old, next))) reason = 'non-fast-forward';
+    if (reason) report.push('ng ' + ref + ' ' + reason);
+    else {
+      if (next === zero) git.refs.delete(ref);
+      else git.refs.set(ref, next);
+      report.push('ok ' + ref);
+    }
+  }
+  if (!capabilities.split(' ').includes('report-status')) return Buffer.alloc(0);
+  const body = packets(report);
+  return capabilities.split(' ').includes('side-band-64k') ? band(body) : body;
+}
 
 export class HttpError extends Error {
   readonly status: number;
@@ -29,7 +477,67 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return parts.length === 1 ? parts[0]! : Buffer.concat(parts);
 }
 
-async function dispatch(req: IncomingMessage, res: ServerResponse, token: string) {
+type Input = Record<string, unknown>;
+const record = (v: unknown): v is Input => typeof v === 'object' && v !== null && !Array.isArray(v);
+const string = (v: unknown, field: string) => typeof v === 'string' && v.length ? v : invalid('Missing or invalid ' + field);
+const nodeId = (kind: string, id: number) => Buffer.from(kind + ':' + id).toString('base64');
+
+async function jsonBody(req: IncomingMessage) {
+  const body = await readBody(req);
+  if (!body.length) return {};
+  try { return JSON.parse(body.toString('utf8')) as unknown; }
+  catch { throw new HttpError(400, 'Problems parsing JSON'); }
+}
+
+class Repository extends GitStore {
+  id: number;
+  name: string;
+  description: string;
+  private: boolean;
+  constructor(id: number, input: Input) {
+    super();
+    this.id = id;
+    this.name = string(input.name, 'name');
+    this.description = typeof input.description === 'string' ? input.description : '';
+    this.private = input.private === true;
+  }
+}
+
+class Forge {
+  // The published trial provisions one bearer principal. A standalone installation can name its own.
+  owner = process.env.FORGE_OWNER ?? 'adaiversen';
+  repos = new Map<string, Repository>();
+  nextId = 2;
+  readonly viewer = { login: this.owner, id: 1, node_id: nodeId('User', 1), type: 'User' };
+  readonly instant: Date;
+  readonly iso: string;
+
+  constructor() {
+    const now = process.env.MAKEFUN_TRIAL_NOW ?? '0';
+    this.instant = new Date(/^\d+$/.test(now) ? Number(now) : now);
+    this.iso = this.instant.toISOString();
+  }
+
+  repository(owner: string, name: string) {
+    if (owner.toLowerCase() !== this.owner.toLowerCase()) return missing();
+    return this.repos.get(name.toLowerCase()) ?? missing();
+  }
+
+  describe(repo: Repository) {
+    return { id: repo.id, node_id: nodeId('Repository', repo.id), name: repo.name, full_name: this.owner + '/' + repo.name, private: repo.private, owner: this.viewer, default_branch: repo.defaultBranch, description: repo.description, has_issues: true };
+  }
+
+  createRepo(input: Input) {
+    const name = string(input.name, 'name');
+    if (!/^[A-Za-z0-9_.-]{1,100}$/.test(name) || name === '.' || name === '..') return invalid('Invalid repository name');
+    if (this.repos.has(name.toLowerCase())) return invalid('Repository already exists');
+    const repo = new Repository(this.nextId++, input);
+    this.repos.set(name.toLowerCase(), repo);
+    return repo;
+  }
+}
+
+async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
   const url = new URL(req.url ?? '/', 'http://forge');
   const path = url.pathname;
   if (req.method === 'GET' && path === '/healthz') return sendJson(res, 200, { ok: true });
@@ -42,16 +550,35 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
     res.setHeader('x-oauth-scopes', 'repo, read:org');
     return sendJson(res, 200, { current_user_url: '/api/v3/user', user_repositories_url: '/api/v3/user/repos' });
   }
+  const remote = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-(?:upload|receive)-pack)$/.exec(path);
+  if (remote) {
+    const repo = forge.repository(decodeURIComponent(remote[1]!), decodeURIComponent(remote[2]!));
+    const discovery = remote[3] === 'info/refs';
+    const service = discovery ? url.searchParams.get('service') : remote[3];
+    if (!['git-upload-pack', 'git-receive-pack'].includes(service ?? '') || req.method !== (discovery ? 'GET' : 'POST')) return missing();
+    const v2 = service === 'git-upload-pack' && req.headers['git-protocol']?.includes('version=2') === true;
+    const body = discovery ? advertise(repo, service!, v2) : service === 'git-upload-pack'
+      ? uploadPack(repo, await readBody(req), v2) : receivePack(repo, await readBody(req));
+    res.writeHead(200, { 'content-type': 'application/x-' + service + (discovery ? '-advertisement' : '-result'), 'content-length': body.length, 'cache-control': 'no-cache' });
+    res.end(body);
+    return;
+  }
+  if (path === '/api/v3/user/repos' && req.method === 'POST') {
+    const body = await jsonBody(req);
+    if (!record(body)) return invalid();
+    return sendJson(res, 201, forge.describe(forge.createRepo(body)));
+  }
   throw new HttpError(404, 'Not Found');
 }
 
 export function createApp() {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const forge = new Forge();
   let requestId = 0;
   return createServer((req, res) => {
     res.sendDate = false;
     res.setHeader('x-github-request-id', (++requestId).toString(16));
-    void dispatch(req, res, token).catch((error: unknown) => {
+    void dispatch(req, res, token, forge).catch((error: unknown) => {
       if (res.destroyed || res.headersSent) return;
       const status = error instanceof HttpError ? error.status : 500;
       sendJson(res, status, { message: error instanceof HttpError ? error.message : 'Internal Server Error' });
