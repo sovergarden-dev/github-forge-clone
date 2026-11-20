@@ -546,7 +546,14 @@ func (f *forge) smart(req *http.Request, data []byte) response {
 		if req.Method != "GET" {
 			missing()
 		}
-		service = req.URL.Query().Get("service")
+		switch req.URL.RawQuery {
+		case "service=git-upload-pack":
+			service = upload
+		case "service=git-receive-pack":
+			service = receive
+		default:
+			service = req.URL.Query().Get("service")
+		}
 	} else if req.Method != "POST" {
 		missing()
 	}
@@ -555,7 +562,11 @@ func (f *forge) smart(req *http.Request, data []byte) response {
 	}
 	v2 := service == upload && strings.Contains(req.Header.Get("Git-Protocol"), "version=2")
 	if discovery {
-		return response{200, "application/x-" + service + "-advertisement", r.advertisement(service, v2)}
+		mime := "application/x-git-upload-pack-advertisement"
+		if service == receive {
+			mime = "application/x-git-receive-pack-advertisement"
+		}
+		return response{200, mime, r.advertisement(service, v2)}
 	}
 	if service == receive {
 		return response{200, "application/x-git-receive-pack-result", r.receivePack(data)}

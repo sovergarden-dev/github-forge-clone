@@ -374,7 +374,13 @@ func (repo *repository) unpack(pack []byte) {
 		return b
 	}
 	staged := make(map[oid]*object, count)
-	offsets := make(map[int]*object, count)
+	type located struct {
+		pos int
+		obj *object
+	}
+	var local [8]located
+	locations := local[:0]
+	var offsets map[int]*object
 	var pending []pendingDelta
 	accept := func(pos int, kind byte, data, compressed []byte) {
 		id := hashObject(kind, data)
@@ -382,11 +388,25 @@ func (repo *repository) unpack(pack []byte) {
 		if obj == nil {
 			obj = newObject(kind, data, compressed)
 		}
-		staged[id], offsets[pos] = obj, obj
+		staged[id] = obj
+		if offsets == nil {
+			locations = append(locations, located{pos, obj})
+		} else {
+			offsets[pos] = obj
+		}
 	}
 	resolve := func(d pendingDelta) bool {
-		base := offsets[d.basePos]
-		if d.basePos == 0 {
+		var base *object
+		if d.basePos != 0 {
+			if offsets == nil {
+				offsets = make(map[int]*object, len(locations))
+				for _, entry := range locations {
+					offsets[entry.pos] = entry.obj
+				}
+				locations = nil
+			}
+			base = offsets[d.basePos]
+		} else {
 			base = staged[d.baseID]
 			if base == nil {
 				base = repo.objects[d.baseID]

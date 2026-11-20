@@ -224,12 +224,16 @@ func (f *forge) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r := f.safely(w, req)
 	h := w.Header()
 	h["Date"] = nil
-	h.Set("X-GitHub-Request-Id", strconv.FormatUint(f.requestCount.Add(1), 16))
+	h["X-Github-Request-Id"] = []string{strconv.FormatUint(f.requestCount.Add(1), 16)}
 	if r.mime != "" {
-		h.Set("Content-Type", r.mime)
+		if r.mime == jsonType {
+			h["Content-Type"] = jsonHeader
+		} else {
+			h["Content-Type"] = []string{r.mime}
+		}
 	}
 	if r.status != 204 {
-		h.Set("Content-Length", strconv.Itoa(len(r.body)))
+		h["Content-Length"] = []string{strconv.Itoa(len(r.body))}
 	}
 	w.WriteHeader(r.status)
 	if len(r.body) > 0 {
