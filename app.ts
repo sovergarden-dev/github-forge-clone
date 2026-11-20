@@ -911,6 +911,224 @@ async function rest(req: IncomingMessage, res: ServerResponse, forge: Forge, url
   return missing();
 }
 
+type Selection = { name: string; alias: string; args: Input; fields: Selection[]; on?: string; fragment?: string };
+type Operation = { name: string; type: string; fields: Selection[]; defaults: Input };
+type Variable = { variable: string };
+const graphError = (message: string): never => { throw new Error(message); };
+
+function parseDocument(source: string) {
+  const tokens: string[] = [];
+  const lex = /\s+|,|#[^\r\n]*|\.\.\.|[!$():=@\[\]{}|]|"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|[_A-Za-z][_0-9A-Za-z]*/gy;
+  let offset = 0;
+  while (offset < source.length) {
+    const match = lex.exec(source);
+    if (!match) return graphError('Invalid token at ' + offset);
+    offset = lex.lastIndex;
+    if (!/^[\s,#]/.test(match[0])) tokens.push(match[0]);
+  }
+  let pos = 0;
+  const next = () => tokens[pos++] ?? graphError('Unexpected end of document');
+  const accept = (token: string) => tokens[pos] === token && (++pos, true);
+  const need = (token: string) => accept(token) || graphError('Expected ' + token);
+  const name = () => { const s = next(); return /^[_A-Za-z]/.test(s) ? s : graphError('Expected a field name'); };
+  function value(): unknown {
+    if (accept('$')) return { variable: name() } satisfies Variable;
+    if (accept('[')) {
+      const list = [];
+      while (!accept(']')) list.push(value());
+      return list;
+    }
+    if (accept('{')) {
+      const object: Input = Object.create(null);
+      while (!accept('}')) { const key = name(); need(':'); object[key] = value(); }
+      return object;
+    }
+    const token = next();
+    if (token.startsWith('"')) return JSON.parse(token);
+    if (/^[-0-9]/.test(token)) return Number(token);
+    if (token === 'true' || token === 'false') return token === 'true';
+    return token === 'null' ? null : token;
+  }
+  function args() {
+    const data: Input = Object.create(null);
+    if (accept('(')) while (!accept(')')) { const key = name(); need(':'); data[key] = value(); }
+    return data;
+  }
+  const directives = (data: Input) => { while (accept('@')) { const key = name(); data['@' + key] = args().if; } };
+  function fields(): Selection[] {
+    need('{');
+    const result: Selection[] = [];
+    while (!accept('}')) {
+      if (accept('...')) {
+        const inline = accept('on');
+        const target = name(), options: Input = {};
+        directives(options);
+        result.push({ name: '', alias: '', args: options, ...(inline ? { on: target } : { fragment: target }), fields: inline ? fields() : [] });
+      } else {
+        const alias = name();
+        const key = accept(':') ? name() : alias;
+        const data = args();
+        directives(data);
+        result.push({ name: key, alias, args: data, fields: tokens[pos] === '{' ? fields() : [] });
+      }
+    }
+    return result;
+  }
+  const operations: Operation[] = [];
+  const fragments = new Map<string, { on: string; fields: Selection[] }>();
+  while (pos < tokens.length) {
+    if (accept('fragment')) {
+      const key = name(); need('on'); fragments.set(key, { on: name(), fields: fields() }); continue;
+    }
+    let type = 'query', label = '';
+    const defaults: Input = Object.create(null);
+    if (tokens[pos] !== '{') {
+      type = name();
+      if (type !== 'mutation' && type !== 'query') return graphError('Unsupported operation ' + type);
+      if (tokens[pos] !== '(' && tokens[pos] !== '{') label = name();
+      if (accept('(')) while (!accept(')')) {
+        need('$'); const key = name(); need(':');
+        while (accept('[')) { /* nested list type */ }
+        name();
+        while (accept('!') || accept(']')) { /* list and nullability modifiers */ }
+        if (accept('=')) defaults[key] = value();
+      }
+    }
+    operations.push({ type, name: label, defaults, fields: fields() });
+  }
+  return { operations, fragments };
+}
+
+const typeFields: Record<string, string[]> = {
+  User: ['id', 'login', 'databaseId'],
+  Repository: ['id', 'databaseId', 'name', 'nameWithOwner', 'description', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'isPrivate', 'issue', 'issues', 'pullRequests', 'pullRequest'],
+  Issue: ['id', 'databaseId', 'number', 'title', 'body', 'state', 'author', 'createdAt', 'updatedAt', 'closedAt', 'comments', 'labels'],
+  PullRequest: ['id', 'databaseId', 'number', 'title', 'body', 'author', 'createdAt', 'updatedAt', 'closedAt', 'headRefName', 'baseRefName', 'headRefOid', 'baseRefOid', 'mergeable', 'state', 'merged', 'files', 'comments', 'labels'],
+  IssueComment: ['id', 'databaseId', 'body', 'author', 'createdAt', 'updatedAt'],
+};
+const typeEnums: Record<string, string[]> = { SearchType: ['ISSUE', 'REPOSITORY', 'USER'], IssueState: ['OPEN', 'CLOSED'], PullRequestState: ['OPEN', 'CLOSED', 'MERGED'] };
+
+function connection<T>(all: T[], args: Input) {
+  const cursor = (index: number) => Buffer.from('cursor:' + index).toString('base64');
+  const start = typeof args.after === 'string' ? Number(Buffer.from(args.after, 'base64').toString().match(/^cursor:(\d+)$/)?.[1] ?? -1) + 1 : 0;
+  const count = Math.max(0, Math.min(100, Number(args.first ?? 30)));
+  const nodes = all.slice(start, start + count);
+  const edges = nodes.map((node, i) => ({ node, cursor: cursor(start + i) }));
+  return { nodes, edges, totalCount: all.length, pageInfo: { hasPreviousPage: start > 0, hasNextPage: start + nodes.length < all.length, startCursor: edges[0]?.cursor ?? null, endCursor: edges.at(-1)?.cursor ?? null } };
+}
+
+function graph(forge: Forge, request: unknown) {
+  try {
+    if (!record(request) || typeof request.query !== 'string') return graphError('Expected a GraphQL query');
+    const { operations, fragments } = parseDocument(request.query);
+    const op = request.operationName ? operations.find(o => o.name === request.operationName) : operations.length === 1 ? operations[0] : null;
+    if (!op) return graphError('An operation name is required for this document');
+    const variables = { ...op.defaults, ...(record(request.variables) ? request.variables : {}) };
+    function resolve(v: unknown): unknown {
+      if (Array.isArray(v)) return v.map(resolve);
+      if (!record(v)) return v;
+      if (typeof v.variable === 'string' && Object.keys(v).length === 1) return variables[v.variable];
+      return Object.fromEntries(Object.entries(v).map(([k, child]) => [k, resolve(child)]));
+    }
+    const user = { __typename: 'User', id: forge.viewer.node_id, databaseId: forge.viewer.id, login: forge.owner };
+    const comment = (c: Comment) => ({ __typename: 'IssueComment', id: c.node_id, databaseId: c.id, body: c.body, author: user, createdAt: c.created_at, updatedAt: c.updated_at });
+    function issue(r: Repository, i: Issue) {
+      return { __typename: 'Issue', id: i.node_id, databaseId: i.id, number: i.number, title: i.title, state: i.state.toUpperCase(), body: i.body, author: user, createdAt: i.created_at, updatedAt: i.updated_at, closedAt: i.closed_at,
+        comments: (a: Input) => connection((r.comments.get(i.number) ?? []).map(comment), a),
+        labels: (a: Input) => connection(i.labels.map(l => ({ ...l, id: l.node_id })), a) };
+    }
+    function pull(r: Repository, p: Pull) {
+      return { ...issue(r, p), __typename: 'PullRequest', headRefName: p.head.ref, baseRefName: p.base.ref, headRefOid: p.head.sha, baseRefOid: p.base.sha, merged: p.merged, state: p.merged ? 'MERGED' : p.state.toUpperCase(),
+        mergeable: () => p.merged ? 'UNKNOWN' : r.mergeTree(p) ? 'MERGEABLE' : 'CONFLICTING',
+        files: (a: Input) => connection(r.files(p).map(f => ({ path: f.filename, additions: f.additions, deletions: f.deletions, changeType: f.status.toUpperCase() })), a) };
+    }
+    function selected<T extends Issue>(items: Iterable<T>, a: Input) {
+      const states = a.states === undefined ? null : new Set((Array.isArray(a.states) ? a.states : [a.states]).map(s => String(s).toLowerCase()));
+      return listItems(items, 'all', record(a.orderBy) && a.orderBy.direction === 'ASC')
+        .filter(i => !states || states.has('merged' in i && i.merged ? 'merged' : i.state));
+    }
+    function repository(r: Repository) {
+      const head = r.refs.get(refHead(r.defaultBranch));
+      return { __typename: 'Repository', id: nodeId('Repository', r.id), databaseId: r.id, name: r.name, nameWithOwner: forge.owner + '/' + r.name, description: r.description, owner: user, defaultBranchRef: head ? { name: r.defaultBranch, target: { oid: head } } : null, viewerPermission: 'ADMIN', hasIssuesEnabled: true, isPrivate: r.private,
+        issue: (a: Input) => r.issues.has(Number(a.number)) ? issue(r, r.issues.get(Number(a.number))!) : null,
+        pullRequest: (a: Input) => r.pulls.has(Number(a.number)) ? pull(r, r.pull(Number(a.number))) : null,
+        issues: (a: Input) => connection(selected(r.issues.values(), a).map(i => issue(r, i)), a),
+        pullRequests: (a: Input) => connection(selected(r.pulls.values(), a).map(p => pull(r, r.pull(p.number))), a) };
+    }
+    function findNode(id: unknown) {
+      for (const r of forge.repos.values()) {
+        if (nodeId('Repository', r.id) === id) return { r, value: repository(r) };
+        for (const i of r.issues.values()) if (i.node_id === id) return { r, i, value: issue(r, i) };
+        for (const p of r.pulls.values()) if (p.node_id === id) return { r, i: p, p, value: pull(r, r.pull(p.number)) };
+      }
+      return null;
+    }
+    const query = { __typename: 'Query', viewer: user,
+      repository: (a: Input) => {
+        const r = String(a.owner).toLowerCase() === forge.owner.toLowerCase() && forge.repos.get(String(a.name).toLowerCase());
+        return r ? repository(r) : null;
+      },
+      node: (a: Input) => a.id === user.id ? user : findNode(a.id)?.value ?? null,
+      __type: (a: Input) => {
+        const name = String(a.name), names = (rows: string[]) => rows.map(name => ({ name }));
+        if (Object.hasOwn(typeFields, name)) return { kind: 'OBJECT', name, fields: names(typeFields[name]!), enumValues: null };
+        return Object.hasOwn(typeEnums, name) ? { kind: 'ENUM', name, enumValues: names(typeEnums[name]!), fields: null } : null;
+      } };
+    function mutation(method: string, a: Input) {
+      const data = record(a.input) ? a.input : graphError('Missing input for ' + method);
+      const target = findNode(data.repositoryId ?? data.issueId ?? data.pullRequestId ?? data.subjectId) ?? graphError('Unknown node ID');
+      const { r } = target;
+      let payload: Input;
+      switch (method) {
+        case 'createIssue': payload = { issue: issue(r, forge.newIssue(r, data)) }; break;
+        case 'closeIssue':
+        case 'reopenIssue': {
+          const i = target.i ?? graphError('Expected issue ID');
+          payload = { issue: issue(r, forge.editIssue(r, i, { state: method === 'closeIssue' ? 'closed' : 'open' })) }; break;
+        }
+        case 'addComment': {
+          const i = target.i ?? graphError('Expected issue or pull request ID');
+          payload = { commentEdge: { node: comment(forge.comment(r, i, data.body)) } }; break;
+        }
+        case 'createPullRequest': payload = { pullRequest: pull(r, forge.openPull(r, { ...data, base: data.baseRefName, head: data.headRefName })) }; break;
+        case 'mergePullRequest': {
+          const p = target.p ?? graphError('Expected pull request ID');
+          forge.merge(r, p.number, { merge_method: String(data.mergeMethod ?? 'SQUASH').toLowerCase(), sha: data.expectedHeadOid });
+          payload = { pullRequest: pull(r, p) }; break;
+        }
+        default: return graphError('Unknown mutation ' + method);
+      }
+      return { ...payload, clientMutationId: data.clientMutationId ?? null };
+    }
+    function project(value: unknown, fields: Selection[], seen: Set<string>): unknown {
+      if (value == null || !fields.length) return value ?? null;
+      if (Array.isArray(value)) return value.map(v => project(v, fields, seen));
+      if (!record(value)) return graphError('Selection on a scalar field');
+      const output: Input = Object.create(null);
+      for (const f of fields) {
+        const a = resolve(f.args) as Input;
+        if (a['@skip'] === true || a['@include'] === false) continue;
+        if (f.on || f.fragment) {
+          const spec = f.fragment ? fragments.get(f.fragment) ?? graphError('Unknown fragment ' + f.fragment) : f;
+          if (spec.on !== value.__typename && spec.on !== 'Node') continue;
+          if (f.fragment && seen.has(f.fragment)) return graphError('Cyclic fragment ' + f.fragment);
+          const active = new Set(seen);
+          if (f.fragment) active.add(f.fragment);
+          Object.assign(output, project(value, spec.fields, active));
+          continue;
+        }
+        if (!Object.hasOwn(value, f.name)) return graphError('Cannot query field "' + f.name + '" on type "' + (value.__typename ?? 'Object') + '"');
+        const entry = value[f.name];
+        output[f.alias] = project(typeof entry === 'function' ? entry(a) : entry, f.fields, seen);
+      }
+      return output;
+    }
+    const mutations = ['createIssue','closeIssue','reopenIssue','addComment','createPullRequest','mergePullRequest'];
+    const root = op.type === 'query' ? query : Object.fromEntries(mutations.map(m => [m, (a: Input) => mutation(m, a)]));
+    return { data: project(root, op.fields, new Set()) };
+  } catch (e) { return { errors: [{ message: e instanceof Error ? e.message : 'Invalid document' }] }; }
+}
+
 async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
   const url = new URL(req.url ?? '/', 'http://' + (req.headers.host ?? 'forge'));
   const path = url.pathname;
@@ -938,6 +1156,10 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
     return;
   }
   if (path.startsWith('/api/v3/')) return rest(req, res, forge, url);
+  if (path === '/api/graphql' && req.method === 'POST') {
+    const body = await jsonBody(req);
+    return sendJson(res, 200, Array.isArray(body) ? body.map(document => graph(forge, document)) : graph(forge, body));
+  }
   throw new HttpError(404, 'Not Found');
 }
 
