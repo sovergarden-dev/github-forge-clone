@@ -1,12 +1,27 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+func (f *forge) createIssueHTTP(r *repository, raw []byte) response {
+	var input struct {
+		Title  string `json:"title"`
+		Body   string `json:"body"`
+		Labels []any  `json:"labels"`
+	}
+	if err := json.Unmarshal(raw, &input); err != nil || input.Title == "" {
+		// The common object decoder supplies the same field and JSON errors as MCP.
+		return response{201, jsonType, f.newIssue(r, jsonObject(raw), "Issue").wire}
+	}
+	item := f.addIssue(r, input.Title, input.Body, r.labelsFor(input.Labels), "Issue")
+	return response{201, jsonType, item.wire}
+}
 
 func page[T any](rows []T, req *http.Request, w http.ResponseWriter) []T {
 	q := req.URL.Query()
@@ -56,6 +71,15 @@ func queryDefault(q url.Values, key, fallback string) string {
 func (f *forge) rest(w http.ResponseWriter, req *http.Request, raw []byte) response {
 	method := req.Method
 	path := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v3"), "/")
+	if method == http.MethodPost && strings.HasSuffix(path, "/issues") {
+		if tail, ok := strings.CutPrefix(path, "/repos/"); ok {
+			owner, tail, _ := strings.Cut(tail, "/")
+			name, resource, _ := strings.Cut(tail, "/")
+			if resource == "issues" {
+				return f.createIssueHTTP(f.repo(owner, name), raw)
+			}
+		}
+	}
 	var d doc
 	if len(raw) > 0 {
 		d = jsonObject(raw)
