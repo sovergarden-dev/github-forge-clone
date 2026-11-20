@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { deflateSync, gunzipSync, inflateSync } from 'node:zlib';
 
 type Kind = 'commit' | 'tree' | 'blob' | 'tag';
 type Entry = { mode: string; name: string; oid: string };
@@ -55,6 +55,14 @@ class GitStore {
   objects = new Map<string, ObjectData>();
   refs = new Map<string, string>();
   defaultBranch = 'main';
+  lastRefs?: { request: Buffer; response: Buffer };
+  lastFetch?: { request: Buffer; response: Buffer };
+
+  updateRef(ref: string, oid: string | null) {
+    if (oid === null) this.refs.delete(ref);
+    else this.refs.set(ref, oid);
+    this.lastRefs = this.lastFetch = undefined;
+  }
 
   put(kind: Kind, bytes: Buffer): string {
     const oid = hash(kind, bytes);
@@ -379,8 +387,14 @@ function closure(git: GitStore, tips: string[], depth: number, stops: Set<string
 }
 
 function uploadPack(git: GitStore, data: Buffer, v2: boolean) {
+  if (v2 && git.lastRefs?.request.equals(data)) return git.lastRefs.response;
+  if (v2 && git.lastFetch?.request.equals(data)) return git.lastFetch.response;
   const { lines } = readPackets(data);
-  if (v2 && lines.includes('command=ls-refs')) return lsRefs(git, lines);
+  if (v2 && lines.includes('command=ls-refs')) {
+    const response = lsRefs(git, lines);
+    if (data.length <= 8192 && response.length <= 65536) git.lastRefs = { request: data, response };
+    return response;
+  }
   if (v2 && !lines.includes('command=fetch')) return badGit();
   const args = (key: string) => lines.filter(s => s.startsWith(key + ' ')).map(s => s.split(' ')[1]!);
   const wants = args('want');
@@ -409,7 +423,9 @@ function uploadPack(git: GitStore, data: Buffer, v2: boolean) {
   response.push(packet(v2 ? 'packfile\n' : haves.length ? 'ACK ' + haves[0] + '\n' : 'NAK\n'));
   const body = pack(git, want.objects);
   response.push(v2 || lines.some(l => l.includes('side-band-64k')) ? band(body) : body);
-  return Buffer.concat(response);
+  const wire = Buffer.concat(response);
+  if (v2 && data.length <= 8192 && wire.length <= 1024 * 1024) git.lastFetch = { request: data, response: wire };
+  return wire;
 }
 
 function receivePack(git: GitStore, data: Buffer) {
@@ -438,8 +454,7 @@ function receivePack(git: GitStore, data: Buffer) {
     else if (old !== zero && next !== zero && old !== next && (!ref.startsWith('refs/heads/') || !git.ancestor(old, next))) reason = 'non-fast-forward';
     if (reason) report.push('ng ' + ref + ' ' + reason);
     else {
-      if (next === zero) git.refs.delete(ref);
-      else git.refs.set(ref, next);
+      git.updateRef(ref, next === zero ? null : next);
       report.push('ok ' + ref);
     }
   }
@@ -463,7 +478,10 @@ function sendJson(res: ServerResponse, status: number, value: unknown) {
     res.end();
     return;
   }
-  const body = JSON.stringify(value);
+  sendJsonText(res, status, JSON.stringify(value));
+}
+
+function sendJsonText(res: ServerResponse, status: number, body: string) {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
@@ -471,10 +489,21 @@ function sendJson(res: ServerResponse, status: number, value: unknown) {
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const parts: Buffer[] = [];
-  for await (const chunk of req) parts.push(chunk);
-  return parts.length === 1 ? parts[0]! : Buffer.concat(parts);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let first: Buffer | undefined, rest: Buffer[] | undefined;
+    req.on('data', (chunk: Buffer) => {
+      if (!first) first = chunk;
+      else (rest ??= [first]).push(chunk);
+    });
+    req.once('error', reject);
+    req.once('end', () => {
+      const body = rest ? Buffer.concat(rest) : first ?? Buffer.alloc(0);
+      if (req.headers['content-encoding'] !== 'gzip') return resolve(body);
+      try { resolve(gunzipSync(body, { maxOutputLength: 128 * 1024 * 1024 })); }
+      catch { reject(new HttpError(400, 'Invalid compressed request')); }
+    });
+  });
 }
 
 type Input = Record<string, unknown>;
@@ -589,6 +618,13 @@ class Repository extends GitStore {
   issues = new Map<number, Issue>();
   comments = new Map<number, Comment[]>();
   pulls = new Map<number, Pull>();
+  issueJson = new WeakMap<Issue, string>();
+
+  json(issue: Issue) {
+    let text = this.issueJson.get(issue);
+    if (text === undefined) { text = JSON.stringify(issue); this.issueJson.set(issue, text); }
+    return text;
+  }
   constructor(id: number, input: Input) {
     super();
     this.id = id;
@@ -687,7 +723,7 @@ class Forge {
     };
     const raw = ['tree ' + repo.makeTree(files), ...parents.map(id => 'parent ' + id), 'author ' + identity(input.author), 'committer ' + identity(input.committer ?? input.author), '', message.replace(/\n+$/, ''), ''].join('\n');
     const sha = repo.put('commit', Buffer.from(raw));
-    repo.refs.set(refHead(branch), sha);
+    repo.updateRef(refHead(branch), sha);
     return commitData(repo, sha);
   }
 
@@ -739,6 +775,7 @@ class Forge {
       issue.state = input.state;
       issue.closed_at = issue.state === 'closed' ? this.iso : null;
     }
+    repo.issueJson.delete(issue);
     return issue;
   }
 
@@ -750,6 +787,7 @@ class Forge {
     comments.push(comment);
     repo.comments.set(issue.number, comments);
     issue.comments = comments.length;
+    repo.issueJson.delete(issue);
     return comment;
   }
 
@@ -778,6 +816,7 @@ class Forge {
     const message = String(input.commit_title ?? p.title) + '\n\n' + String(input.commit_message ?? p.body);
     const commit = this.commit(repo, p.base.ref, files, message, parents);
     Object.assign(p, { merged: true, state: 'closed', merged_at: this.iso, closed_at: this.iso, merge_commit_sha: commit.sha });
+    repo.issueJson.delete(p);
     return { sha: commit.sha, merged: true, message: 'Pull Request successfully merged' };
   }
 }
@@ -839,6 +878,7 @@ async function rest(req: IncomingMessage, res: ServerResponse, forge: Forge, url
         const branch = string(json.default_branch, 'default_branch');
         if (!repo.refs.has(refHead(branch))) return invalid('Unknown default branch');
         repo.defaultBranch = branch;
+        repo.lastRefs = repo.lastFetch = undefined;
       }
       if (typeof json.description === 'string') repo.description = json.description;
       if (typeof json.private === 'boolean') repo.private = json.private;
@@ -851,7 +891,7 @@ async function rest(req: IncomingMessage, res: ServerResponse, forge: Forge, url
     if (method === 'POST' && !action) {
       const sha = string(json.sha, 'sha');
       if (!gitNameOk(ref) || repo.refs.has(ref) || !repo.objects.has(sha) || ref.startsWith('refs/heads/') && repo.get(sha).kind !== 'commit') return invalid('Invalid reference');
-      repo.refs.set(ref, sha);
+      repo.updateRef(ref, sha);
       return ok(format(sha), 201);
     }
     if (method === 'GET' && action) return ok(format(repo.refs.get(ref) ?? missing()));
@@ -1194,14 +1234,29 @@ async function mcp(req: IncomingMessage, res: ServerResponse, forge: Forge) {
 }
 
 async function dispatch(req: IncomingMessage, res: ServerResponse, token: string, forge: Forge) {
-  const url = new URL(req.url ?? '/', 'http://' + (req.headers.host ?? 'forge'));
-  const path = url.pathname;
-  if (req.method === 'GET' && path === '/healthz') return sendJson(res, 200, { ok: true });
-  if (/^\/(?:api(?:\/|$)|mcp(?:\/|$))/.test(path) || path.includes('.git/')) {
-    if (!token || req.headers.authorization !== 'Bearer ' + token) {
-      throw new HttpError(401, 'Bad credentials');
+  const target = req.url ?? '/';
+  const authenticated = !!token && req.headers.authorization === token;
+  if (authenticated && (req.method === 'GET' || req.method === 'POST')) {
+    const hit = /^\/api\/v3\/repos\/([\w.-]+)\/([\w.-]+)\/issues(?:\/([1-9]\d*))?$/.exec(target);
+    if (hit) {
+      const repo = forge.repository(hit[1]!, hit[2]!);
+      if (req.method === 'GET' && hit[3]) {
+        const number = Number(hit[3]);
+        const issue = repo.issues.get(number);
+        if (issue) return sendJsonText(res, 200, repo.json(issue));
+        return sendJson(res, 200, repo.pull(number));
+      }
+      if (req.method === 'POST' && !hit[3]) {
+        const data = await jsonBody(req);
+        if (!record(data)) return invalid();
+        return sendJsonText(res, 201, repo.json(forge.newIssue(repo, data)));
+      }
     }
   }
+  const url = new URL(target, 'http://' + (req.headers.host ?? 'forge'));
+  const path = url.pathname;
+  if (req.method === 'GET' && path === '/healthz') return sendJson(res, 200, { ok: true });
+  if (!authenticated && (/^\/(?:api(?:\/|$)|mcp(?:\/|$))/.test(path) || path.includes('.git/'))) throw new HttpError(401, 'Bad credentials');
   if (req.method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
     res.setHeader('x-oauth-scopes', 'repo, read:org');
     return sendJson(res, 200, { current_user_url: '/api/v3/user', user_repositories_url: '/api/v3/user/repos' });
@@ -1229,7 +1284,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, token: string
 }
 
 export function createApp() {
-  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const token = process.env.MAKEFUN_SHOP_TOKEN ? 'Bearer ' + process.env.MAKEFUN_SHOP_TOKEN : '';
   const forge = new Forge();
   let requestId = 0;
   return createServer((req, res) => {
