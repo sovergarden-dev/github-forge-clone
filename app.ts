@@ -9,6 +9,7 @@ type ObjectData = {
   bytes: Buffer;
   entries?: Entry[];
   links?: string[];
+  compressed?: Buffer;
 };
 const kinds = [undefined, 'commit', 'tree', 'blob', 'tag'] as const;
 const zero = '0'.repeat(40);
@@ -239,7 +240,9 @@ function unpack(git: GitStore, data: Buffer) {
       base = data.toString('hex', pos, pos + 20);
       pos += 20;
     } else if (type < 1 || type > 4) return badGit();
-    const inflated = inflateSync(data.subarray(pos, end), { info: true, maxOutputLength: Math.max(size, 1) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const inflated = inflateSync(data.subarray(pos, end), {
+      info: true, maxOutputLength: Math.max(size, 1), chunkSize: Math.max(64, Math.min(65536, size + 1)),
+    }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     pos += inflated.engine.bytesWritten;
     if (inflated.buffer.length !== size) return badGit();
     if (base === undefined) accept(offset, kinds[type as 1 | 2 | 3 | 4], inflated.buffer);
@@ -260,25 +263,88 @@ function unpack(git: GitStore, data: Buffer) {
   for (const [oid, obj] of staged) git.objects.set(oid, obj);
 }
 
-function pack(git: GitStore, objects: Set<string>) {
+function packHeader(type: number, size: number) {
+  let byte = type * 16 + (size & 15);
+  size = Math.floor(size / 16);
+  const header: number[] = [];
+  while (size) {
+    header.push(byte | 128);
+    byte = size & 127;
+    size = Math.floor(size / 128);
+  }
+  header.push(byte);
+  return Buffer.from(header);
+}
+
+function offsetEncoding(distance: number) {
+  const bytes = [distance & 127];
+  while ((distance = Math.floor(distance / 128)) > 0) bytes.push(128 | (--distance & 127));
+  return Buffer.from(bytes.reverse());
+}
+
+function blobDelta(base: Buffer, target: Buffer) {
+  const limit = Math.min(base.length, target.length);
+  let prefix = 0, suffix = 0;
+  while (prefix < limit && base[prefix] === target[prefix]) prefix++;
+  while (suffix < limit - prefix && base[base.length - 1 - suffix] === target[target.length - 1 - suffix]) suffix++;
+  if (prefix + suffix < Math.max(96, target.length / 2)) return null;
+  const instructions: Buffer[] = [];
+  for (let n of [base.length, target.length]) {
+    const bytes: number[] = [];
+    while (n >= 128) { bytes.push((n & 127) | 128); n = Math.floor(n / 128); }
+    instructions.push(Buffer.from([...bytes, n]));
+  }
+  function copy(start: number, size: number) {
+    while (size) {
+      const length = Math.min(size, 0xffffff);
+      let op = 128;
+      const args: number[] = [];
+      for (let i = 0; i < 7; ++i) {
+        const byte = i < 4 ? (start >>> (8 * i)) & 255 : (length >>> (8 * (i - 4))) & 255;
+        if (byte) { op |= 1 << i; args.push(byte); }
+      }
+      instructions.push(Buffer.from([op, ...args]));
+      start += length;
+      size -= length;
+    }
+  }
+  copy(0, prefix);
+  const end = target.length - suffix;
+  for (let pos = prefix; pos < end; pos += 127) {
+    const part = target.subarray(pos, Math.min(end, pos + 127));
+    instructions.push(Buffer.from([part.length]), part);
+  }
+  copy(base.length - suffix, suffix);
+  return Buffer.concat(instructions);
+}
+
+function pack(git: GitStore, objects: Set<string>, allowOffset: boolean) {
   const header = Buffer.alloc(12);
   header.write('PACK');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.size, 8);
-  const parts = [header];
+  const parts: Buffer[] = [header];
+  let offset = header.length;
+  let base: { oid: string; bytes: Buffer; offset: number } | undefined;
   for (const oid of objects) {
     const obj = git.get(oid);
-    let size = obj.bytes.length;
-    let byte = kinds.indexOf(obj.kind) * 16 + (size & 15);
-    size = Math.floor(size / 16);
-    const encoding: number[] = [];
-    while (size) {
-      encoding.push(byte | 128);
-      byte = size & 127;
-      size = Math.floor(size / 128);
+    let compressed = obj.compressed ?? deflateSync(obj.bytes, { level: 1 });
+    if (compressed.length <= 65536) obj.compressed = compressed;
+    let prefix = packHeader(kinds.indexOf(obj.kind), obj.bytes.length);
+    if (obj.kind === 'blob' && obj.bytes.length >= 256) {
+      const delta = base && blobDelta(base.bytes, obj.bytes);
+      if (base && delta) {
+        const ptr = allowOffset ? offsetEncoding(offset - base.offset) : Buffer.from(base.oid, 'hex');
+        const encoded = deflateSync(delta, { level: 1 });
+        if (encoded.length + ptr.length < compressed.length) {
+          prefix = Buffer.concat([packHeader(allowOffset ? 6 : 7, delta.length), ptr]);
+          compressed = encoded;
+        }
+      }
+      if ((prefix[0]! >> 4 & 7) === 3) base = { oid, bytes: obj.bytes, offset };
     }
-    encoding.push(byte);
-    parts.push(Buffer.from(encoding), deflateSync(obj.bytes));
+    parts.push(prefix, compressed);
+    offset += prefix.length + compressed.length;
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -408,20 +474,30 @@ function uploadPack(git: GitStore, data: Buffer, v2: boolean) {
     response.push(packet('acknowledgments\n'), packets(haves.length ? haves.map(oid => 'ACK ' + oid) : ['NAK']));
     return Buffer.concat(response);
   }
-  const want = closure(git, wants, depth, new Set());
+  const relative = Number.isFinite(depth) && lines.includes('deepen-relative') && shallow.size > 0;
+  const keepBoundary = relative || !Number.isFinite(depth);
+  const want = closure(git, wants, relative ? Infinity : depth, keepBoundary ? shallow : new Set());
+  const unshallow: string[] = [];
+  for (const oid of shallow) {
+    if (!want.objects.has(oid)) continue;
+    if (relative && want.boundary.delete(oid)) {
+      const extension = closure(git, links(git.get(oid)).slice(1), depth, new Set());
+      for (const object of extension.objects) want.objects.add(object);
+      for (const boundary of extension.boundary) want.boundary.add(boundary);
+      unshallow.push(oid);
+    } else if (!keepBoundary && !want.boundary.has(oid)) unshallow.push(oid);
+  }
   const have = closure(git, haves, Infinity, shallow);
   for (const oid of have.objects) want.objects.delete(oid);
   const changes = [...want.boundary].filter(oid => !shallow.has(oid)).map(oid => 'shallow ' + oid);
-  for (const oid of shallow) {
-    if (have.objects.has(oid) && !want.boundary.has(oid) && (depth > 1 || !Number.isFinite(depth))) changes.push('unshallow ' + oid);
-  }
+  for (const oid of unshallow) changes.push('unshallow ' + oid);
   if (changes.length || !v2 && Number.isFinite(depth)) {
     if (v2) response.push(packet('shallow-info\n'));
     response.push(...changes.map(line => packet(line + '\n')), v2 ? delim : flush);
   }
   if (!v2 && !lines.includes('done') && !haves.length && Number.isFinite(depth)) return Buffer.concat(response);
   response.push(packet(v2 ? 'packfile\n' : haves.length ? 'ACK ' + haves[0] + '\n' : 'NAK\n'));
-  const body = pack(git, want.objects);
+  const body = pack(git, want.objects, lines.some(l => l.split(' ').includes('ofs-delta')));
   response.push(v2 || lines.some(l => l.includes('side-band-64k')) ? band(body) : body);
   const wire = Buffer.concat(response);
   if (v2 && data.length <= 8192 && wire.length <= 1024 * 1024) git.lastFetch = { request: data, response: wire };
